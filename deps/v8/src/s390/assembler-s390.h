@@ -405,7 +405,7 @@ class Assembler : public AssemblerBase {
   // GetCode emits any pending (non-emitted) code and fills the descriptor
   // desc. GetCode() is idempotent; it returns the same result if no other
   // Assembler functions are invoked in between GetCode() calls.
-  void GetCode(CodeDesc* desc);
+  void GetCode(Isolate* isolate, CodeDesc* desc);
 
   // Label operations & relative jumps (PPUM Appendix D)
   //
@@ -456,6 +456,10 @@ class Assembler : public AssemblerBase {
   // Return the code target address at a call site from the return address
   // of that call in the instruction stream.
   inline static Address target_address_from_return_address(Address pc);
+
+  static void set_heap_number(Handle<HeapObject> number, Address pc) {
+    UNIMPLEMENTED();
+  }
 
   // Given the address of the beginning of a call, return the address
   // in the instruction stream that the call will return to.
@@ -838,8 +842,7 @@ class Assembler : public AssemblerBase {
     basr(r14, r1);
   }
 
-  void call(Handle<Code> target, RelocInfo::Mode rmode,
-            TypeFeedbackId ast_id = TypeFeedbackId::None());
+  void call(Handle<Code> target, RelocInfo::Mode rmode);
   void jump(Handle<Code> target, RelocInfo::Mode rmode, Condition cond);
 
 // S390 instruction generation
@@ -1269,17 +1272,6 @@ class Assembler : public AssemblerBase {
   // Mark address of a debug break slot.
   void RecordDebugBreakSlot(RelocInfo::Mode mode);
 
-  // Record the AST id of the CallIC being compiled, so that it can be placed
-  // in the relocation information.
-  void SetRecordedAstId(TypeFeedbackId ast_id) { recorded_ast_id_ = ast_id; }
-
-  TypeFeedbackId RecordedAstId() {
-    // roohack - another issue??? DCHECK(!recorded_ast_id_.IsNone());
-    return recorded_ast_id_;
-  }
-
-  void ClearRecordedAstId() { recorded_ast_id_ = TypeFeedbackId::None(); }
-
   // Record a comment relocation entry that can be used by a disassembler.
   // Use --code-comments to enable.
   void RecordComment(const char* msg);
@@ -1348,11 +1340,6 @@ class Assembler : public AssemblerBase {
   byte* buffer_pos() const { return buffer_; }
 
  protected:
-  // Relocation for a type-recording IC has the AST id added to it.  This
-  // member variable is a way to pass the information from the call site to
-  // the relocation info.
-  TypeFeedbackId recorded_ast_id_;
-
   int buffer_space() const { return reloc_info_writer.pos() - pc_; }
 
   // Decode instruction(s) at pos and return backchain to previous
@@ -1366,6 +1353,9 @@ class Assembler : public AssemblerBase {
   void RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data = 0);
 
  private:
+  // Avoid overflows for displacements etc.
+  static const int kMaximalBufferSize = 512 * MB;
+
   // Code generation
   // The relocation writer's position is at least kGap bytes below the end of
   // the generated instructions. This is so that multi-instruction sequences do
@@ -1389,8 +1379,7 @@ class Assembler : public AssemblerBase {
   inline void UntrackBranch();
 
   inline int32_t emit_code_target(
-      Handle<Code> target, RelocInfo::Mode rmode,
-      TypeFeedbackId ast_id = TypeFeedbackId::None());
+      Handle<Code> target, RelocInfo::Mode rmode);
 
   // Helpers to emit binary encoding of 2/4/6 byte instructions.
   inline void emit2bytes(uint16_t x);

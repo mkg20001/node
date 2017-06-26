@@ -27,9 +27,11 @@ ScriptOrigin ModuleOrigin(Local<v8::Value> resource_name, Isolate* isolate) {
   return origin;
 }
 
-MaybeLocal<Module> AlwaysEmptyResolveCallback(Local<Context> context,
-                                              Local<String> specifier,
-                                              Local<Module> referrer) {
+MaybeLocal<Module> FailAlwaysResolveCallback(Local<Context> context,
+                                             Local<String> specifier,
+                                             Local<Module> referrer) {
+  Isolate* isolate = context->GetIsolate();
+  isolate->ThrowException(v8_str("boom"));
   return MaybeLocal<Module>();
 }
 
@@ -37,39 +39,65 @@ static int g_count = 0;
 MaybeLocal<Module> FailOnSecondCallResolveCallback(Local<Context> context,
                                                    Local<String> specifier,
                                                    Local<Module> referrer) {
-  if (g_count++ > 0) return MaybeLocal<Module>();
+  Isolate* isolate = CcTest::isolate();
+  if (g_count++ > 0) {
+    isolate->ThrowException(v8_str("booom"));
+    return MaybeLocal<Module>();
+  }
   Local<String> source_text = v8_str("");
-  ScriptOrigin origin = ModuleOrigin(v8_str("module.js"), CcTest::isolate());
+  ScriptOrigin origin = ModuleOrigin(v8_str("module.js"), isolate);
   ScriptCompiler::Source source(source_text, origin);
-  return ScriptCompiler::CompileModule(CcTest::isolate(), &source)
-      .ToLocalChecked();
+  return ScriptCompiler::CompileModule(isolate, &source).ToLocalChecked();
 }
 
 TEST(ModuleInstantiationFailures) {
   Isolate* isolate = CcTest::isolate();
   HandleScope scope(isolate);
   LocalContext env;
+  v8::TryCatch try_catch(isolate);
 
   Local<String> source_text = v8_str(
       "import './foo.js';"
-      "export {} from './bar.js';");
+      "\nexport {} from './bar.js';");
   ScriptOrigin origin = ModuleOrigin(v8_str("file.js"), CcTest::isolate());
   ScriptCompiler::Source source(source_text, origin);
   Local<Module> module =
       ScriptCompiler::CompileModule(isolate, &source).ToLocalChecked();
   CHECK_EQ(2, module->GetModuleRequestsLength());
   CHECK(v8_str("./foo.js")->StrictEquals(module->GetModuleRequest(0)));
+  v8::Location loc = module->GetModuleRequestLocation(0);
+  CHECK_EQ(0, loc.GetLineNumber());
+  CHECK_EQ(7, loc.GetColumnNumber());
+
   CHECK(v8_str("./bar.js")->StrictEquals(module->GetModuleRequest(1)));
+  loc = module->GetModuleRequestLocation(1);
+  CHECK_EQ(1, loc.GetLineNumber());
+  CHECK_EQ(15, loc.GetColumnNumber());
 
   // Instantiation should fail.
-  CHECK(!module->Instantiate(env.local(), AlwaysEmptyResolveCallback));
+  {
+    v8::TryCatch inner_try_catch(isolate);
+    CHECK(module->InstantiateModule(env.local(), FailAlwaysResolveCallback)
+              .IsNothing());
+    CHECK(inner_try_catch.HasCaught());
+    CHECK(inner_try_catch.Exception()->StrictEquals(v8_str("boom")));
+  }
 
   // Start over again...
   module = ScriptCompiler::CompileModule(isolate, &source).ToLocalChecked();
 
   // Instantiation should fail if a sub-module fails to resolve.
   g_count = 0;
-  CHECK(!module->Instantiate(env.local(), FailOnSecondCallResolveCallback));
+  {
+    v8::TryCatch inner_try_catch(isolate);
+    CHECK(
+        module->InstantiateModule(env.local(), FailOnSecondCallResolveCallback)
+            .IsNothing());
+    CHECK(inner_try_catch.HasCaught());
+    CHECK(inner_try_catch.Exception()->StrictEquals(v8_str("booom")));
+  }
+
+  CHECK(!try_catch.HasCaught());
 }
 
 static MaybeLocal<Module> CompileSpecifierAsModuleResolveCallback(
@@ -84,6 +112,7 @@ TEST(ModuleEvaluation) {
   Isolate* isolate = CcTest::isolate();
   HandleScope scope(isolate);
   LocalContext env;
+  v8::TryCatch try_catch(isolate);
 
   Local<String> source_text = v8_str(
       "import 'Object.expando = 5';"
@@ -92,16 +121,21 @@ TEST(ModuleEvaluation) {
   ScriptCompiler::Source source(source_text, origin);
   Local<Module> module =
       ScriptCompiler::CompileModule(isolate, &source).ToLocalChecked();
-  CHECK(module->Instantiate(env.local(),
-                            CompileSpecifierAsModuleResolveCallback));
+  CHECK(module
+            ->InstantiateModule(env.local(),
+                                CompileSpecifierAsModuleResolveCallback)
+            .FromJust());
   CHECK(!module->Evaluate(env.local()).IsEmpty());
   ExpectInt32("Object.expando", 10);
+
+  CHECK(!try_catch.HasCaught());
 }
 
 TEST(ModuleEvaluationCompletion1) {
   Isolate* isolate = CcTest::isolate();
   HandleScope scope(isolate);
   LocalContext env;
+  v8::TryCatch try_catch(isolate);
 
   const char* sources[] = {
       "",
@@ -129,16 +163,21 @@ TEST(ModuleEvaluationCompletion1) {
     ScriptCompiler::Source source(source_text, origin);
     Local<Module> module =
         ScriptCompiler::CompileModule(isolate, &source).ToLocalChecked();
-    CHECK(module->Instantiate(env.local(),
-                              CompileSpecifierAsModuleResolveCallback));
+    CHECK(module
+              ->InstantiateModule(env.local(),
+                                  CompileSpecifierAsModuleResolveCallback)
+              .FromJust());
     CHECK(module->Evaluate(env.local()).ToLocalChecked()->IsUndefined());
   }
+
+  CHECK(!try_catch.HasCaught());
 }
 
 TEST(ModuleEvaluationCompletion2) {
   Isolate* isolate = CcTest::isolate();
   HandleScope scope(isolate);
   LocalContext env;
+  v8::TryCatch try_catch(isolate);
 
   const char* sources[] = {
       "'gaga'; ",
@@ -165,12 +204,16 @@ TEST(ModuleEvaluationCompletion2) {
     ScriptCompiler::Source source(source_text, origin);
     Local<Module> module =
         ScriptCompiler::CompileModule(isolate, &source).ToLocalChecked();
-    CHECK(module->Instantiate(env.local(),
-                              CompileSpecifierAsModuleResolveCallback));
+    CHECK(module
+              ->InstantiateModule(env.local(),
+                                  CompileSpecifierAsModuleResolveCallback)
+              .FromJust());
     CHECK(module->Evaluate(env.local())
               .ToLocalChecked()
               ->StrictEquals(v8_str("gaga")));
   }
+
+  CHECK(!try_catch.HasCaught());
 }
 
 }  // anonymous namespace

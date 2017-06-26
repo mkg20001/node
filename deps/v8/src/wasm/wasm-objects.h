@@ -8,14 +8,16 @@
 #include "src/debug/debug.h"
 #include "src/debug/interface-types.h"
 #include "src/objects.h"
+#include "src/objects/script.h"
 #include "src/trap-handler/trap-handler.h"
 #include "src/wasm/wasm-limits.h"
+#include "src/wasm/wasm-module.h"
 
 namespace v8 {
 namespace internal {
 namespace wasm {
 class InterpretedFrame;
-struct WasmModule;
+class WasmInterpreter;
 }
 
 class WasmCompiledModule;
@@ -71,17 +73,16 @@ class WasmTableObject : public JSObject {
 
   DECLARE_CASTS(WasmTableObject);
   DECLARE_ACCESSORS(functions, FixedArray);
+  DECLARE_GETTER(dispatch_tables, FixedArray);
 
-  FixedArray* dispatch_tables();
   uint32_t current_length();
   bool has_maximum_length();
   int64_t maximum_length();  // Returns < 0 if no maximum.
+  void grow(Isolate* isolate, uint32_t count);
 
   static Handle<WasmTableObject> New(Isolate* isolate, uint32_t initial,
                                      int64_t maximum,
                                      Handle<FixedArray>* js_functions);
-  static void Grow(Isolate* isolate, Handle<WasmTableObject> table,
-                   uint32_t count);
   static Handle<FixedArray> AddDispatchTable(
       Isolate* isolate, Handle<WasmTableObject> table,
       Handle<WasmInstanceObject> instance, int table_index,
@@ -131,6 +132,8 @@ class WasmInstanceObject : public JSObject {
     kGlobalsArrayBuffer,
     kDebugInfo,
     kWasmMemInstanceWrapper,
+    // FixedArray of wasm instances whose code we imported (to keep them alive).
+    kDirectlyCalledInstances,
     kFieldCount
   };
 
@@ -142,9 +145,10 @@ class WasmInstanceObject : public JSObject {
   DECLARE_OPTIONAL_ACCESSORS(memory_object, WasmMemoryObject);
   DECLARE_OPTIONAL_ACCESSORS(debug_info, WasmDebugInfo);
   DECLARE_OPTIONAL_ACCESSORS(instance_wrapper, WasmInstanceWrapper);
+  DECLARE_OPTIONAL_ACCESSORS(directly_called_instances, FixedArray);
 
   WasmModuleObject* module_object();
-  wasm::WasmModule* module();
+  V8_EXPORT_PRIVATE wasm::WasmModule* module();
 
   // Get the debug info associated with the given wasm object.
   // If no debug info exists yet, it is created automatically.
@@ -160,7 +164,7 @@ class WasmInstanceObject : public JSObject {
   uint32_t GetMaxMemoryPages();
 };
 
-// Representation of an exported WASM function.
+// Representation of an exported wasm function.
 class WasmExportedFunction : public JSFunction {
  public:
   // The 0-th field is used by the Blink Wrapper Tracer.
@@ -440,6 +444,10 @@ class WasmCompiledModule : public FixedArray {
   static void ReinitializeAfterDeserialization(Isolate*,
                                                Handle<WasmCompiledModule>);
 
+  // Get the module name, if set. Returns an empty handle otherwise.
+  static MaybeHandle<String> GetModuleNameOrNull(
+      Isolate* isolate, Handle<WasmCompiledModule> compiled_module);
+
   // Get the function name of the function identified by the given index.
   // Returns a null handle if the function is unnamed or the name is not a valid
   // UTF-8 string.
@@ -493,7 +501,7 @@ class WasmCompiledModule : public FixedArray {
   // string.
   static MaybeHandle<String> ExtractUtf8StringFromModuleBytes(
       Isolate* isolate, Handle<WasmCompiledModule> compiled_module,
-      uint32_t offset, uint32_t size);
+      wasm::WireBytesRef ref);
 
   // Get a list of all possible breakpoints within a given range of this module.
   bool GetPossibleBreakpoints(const debug::Location& start,
@@ -519,12 +527,10 @@ class WasmCompiledModule : public FixedArray {
   // call / exported function), func_index must be set. Otherwise it can be -1.
   // If patch_caller is set, then all direct calls to functions which were
   // already lazily compiled are patched (at least the given call site).
-  // Returns the Code to be called at the given call site, or an empty Handle if
-  // an error occured during lazy compilation. In this case, an exception has
-  // been set on the isolate.
-  static MaybeHandle<Code> CompileLazy(Isolate*, Handle<WasmInstanceObject>,
-                                       Handle<Code> caller, int offset,
-                                       int func_index, bool patch_caller);
+  // Returns the Code to be called at the given call site.
+  static Handle<Code> CompileLazy(Isolate*, Handle<WasmInstanceObject>,
+                                  Handle<Code> caller, int offset,
+                                  int func_index, bool patch_caller);
 
   void ReplaceCodeTableForTesting(Handle<FixedArray> testing_table) {
     set_code_table(testing_table);
@@ -548,6 +554,13 @@ class WasmDebugInfo : public FixedArray {
   };
 
   static Handle<WasmDebugInfo> New(Handle<WasmInstanceObject>);
+
+  // Setup a WasmDebugInfo with an existing WasmInstance struct.
+  // Returns a pointer to the interpreter instantiated inside this
+  // WasmDebugInfo.
+  // Use for testing only.
+  V8_EXPORT_PRIVATE static wasm::WasmInterpreter* SetupForTesting(
+      Handle<WasmInstanceObject>, wasm::WasmInstance*);
 
   static bool IsDebugInfo(Object*);
   static WasmDebugInfo* cast(Object*);
@@ -579,7 +592,7 @@ class WasmDebugInfo : public FixedArray {
       Address frame_pointer);
 
   std::unique_ptr<wasm::InterpretedFrame> GetInterpretedFrame(
-      Address frame_pointer, int idx);
+      Address frame_pointer, int frame_index);
 
   // Unwind the interpreted stack belonging to the passed interpreter entry
   // frame.
@@ -593,6 +606,17 @@ class WasmDebugInfo : public FixedArray {
   // Update the memory view of the interpreter after executing GrowMemory in
   // compiled code.
   void UpdateMemory(JSArrayBuffer* new_memory);
+
+  // Get scope details for a specific interpreted frame.
+  // This returns a JSArray of length two: One entry for the global scope, one
+  // for the local scope. Both elements are JSArrays of size
+  // ScopeIterator::kScopeDetailsSize and layout as described in debug-scopes.h.
+  // The global scope contains information about globals and the memory.
+  // The local scope contains information about parameters, locals, and stack
+  // values.
+  static Handle<JSArray> GetScopeDetails(Handle<WasmDebugInfo>,
+                                         Address frame_pointer,
+                                         int frame_index);
 };
 
 class WasmInstanceWrapper : public FixedArray {
@@ -649,8 +673,11 @@ class WasmInstanceWrapper : public FixedArray {
   };
 };
 
+#undef DECLARE_CASTS
+#undef DECLARE_GETTER
 #undef DECLARE_ACCESSORS
 #undef DECLARE_OPTIONAL_ACCESSORS
+#undef DECLARE_OPTIONAL_GETTER
 
 }  // namespace internal
 }  // namespace v8

@@ -47,6 +47,8 @@ const Register StoreTransitionDescriptor::MapRegister() { return edi; }
 const Register StringCompareDescriptor::LeftRegister() { return edx; }
 const Register StringCompareDescriptor::RightRegister() { return eax; }
 
+const Register StringConcatDescriptor::ArgumentsCountRegister() { return eax; }
+
 const Register ApiGetterDescriptor::HolderRegister() { return ecx; }
 const Register ApiGetterDescriptor::CallbackRegister() { return eax; }
 
@@ -56,11 +58,6 @@ const Register MathPowIntegerDescriptor::exponent() {
   return MathPowTaggedDescriptor::exponent();
 }
 
-const Register RegExpExecDescriptor::StringRegister() { return eax; }
-const Register RegExpExecDescriptor::LastIndexRegister() { return ecx; }
-const Register RegExpExecDescriptor::StringStartRegister() { return edx; }
-const Register RegExpExecDescriptor::StringEndRegister() { return ebx; }
-const Register RegExpExecDescriptor::CodeRegister() { return edi; }
 
 const Register GrowArrayElementsDescriptor::ObjectRegister() { return eax; }
 const Register GrowArrayElementsDescriptor::KeyRegister() { return ebx; }

@@ -8,6 +8,8 @@
 #include "src/compiler/opcodes.h"
 #include "src/compiler/operator.h"
 #include "src/compiler/types.h"
+#include "src/objects/map.h"
+#include "src/objects/name.h"
 
 namespace v8 {
 namespace internal {
@@ -25,7 +27,6 @@ std::ostream& operator<<(std::ostream& os, BaseTaggedness base_taggedness) {
       return os << "tagged base";
   }
   UNREACHABLE();
-  return os;
 }
 
 
@@ -50,7 +51,6 @@ MachineType BufferAccess::machine_type() const {
       return MachineType::Float64();
   }
   UNREACHABLE();
-  return MachineType::None();
 }
 
 
@@ -76,7 +76,6 @@ std::ostream& operator<<(std::ostream& os, BufferAccess access) {
 #undef TYPED_ARRAY_CASE
   }
   UNREACHABLE();
-  return os;
 }
 
 
@@ -204,7 +203,6 @@ std::ostream& operator<<(std::ostream& os, CheckFloat64HoleMode mode) {
       return os << "never-return-hole";
   }
   UNREACHABLE();
-  return os;
 }
 
 CheckFloat64HoleMode CheckFloat64HoleModeOf(const Operator* op) {
@@ -232,7 +230,6 @@ std::ostream& operator<<(std::ostream& os, CheckForMinusZeroMode mode) {
       return os << "dont-check-for-minus-zero";
   }
   UNREACHABLE();
-  return os;
 }
 
 std::ostream& operator<<(std::ostream& os, CheckMapsFlags flags) {
@@ -285,11 +282,11 @@ std::ostream& operator<<(std::ostream& os, CheckTaggedInputMode mode) {
       return os << "NumberOrOddball";
   }
   UNREACHABLE();
-  return os;
 }
 
 CheckTaggedInputMode CheckTaggedInputModeOf(const Operator* op) {
-  DCHECK_EQ(IrOpcode::kCheckedTaggedToFloat64, op->opcode());
+  DCHECK(op->opcode() == IrOpcode::kCheckedTaggedToFloat64 ||
+         op->opcode() == IrOpcode::kCheckedTruncateTaggedToWord32);
   return OpParameter<CheckTaggedInputMode>(op);
 }
 
@@ -344,7 +341,6 @@ std::ostream& operator<<(std::ostream& os, ElementsTransition transition) {
                 << " to " << Brief(*transition.target());
   }
   UNREACHABLE();
-  return os;
 }
 
 ElementsTransition const& ElementsTransitionOf(const Operator* op) {
@@ -364,7 +360,6 @@ std::ostream& operator<<(std::ostream& os, NumberOperationHint hint) {
       return os << "NumberOrOddball";
   }
   UNREACHABLE();
-  return os;
 }
 
 size_t hash_value(NumberOperationHint hint) {
@@ -479,8 +474,11 @@ UnicodeEncoding UnicodeEncodingOf(const Operator* op) {
   V(NumberSilenceNaN, Operator::kNoProperties, 1, 0)             \
   V(StringCharAt, Operator::kNoProperties, 2, 1)                 \
   V(StringCharCodeAt, Operator::kNoProperties, 2, 1)             \
+  V(SeqStringCharCodeAt, Operator::kNoProperties, 2, 1)          \
   V(StringFromCharCode, Operator::kNoProperties, 1, 0)           \
   V(StringIndexOf, Operator::kNoProperties, 3, 0)                \
+  V(StringToLowerCaseIntl, Operator::kNoProperties, 1, 0)        \
+  V(StringToUpperCaseIntl, Operator::kNoProperties, 1, 0)        \
   V(PlainPrimitiveToNumber, Operator::kNoProperties, 1, 0)       \
   V(PlainPrimitiveToWord32, Operator::kNoProperties, 1, 0)       \
   V(PlainPrimitiveToFloat64, Operator::kNoProperties, 1, 0)      \
@@ -520,29 +518,31 @@ UnicodeEncoding UnicodeEncodingOf(const Operator* op) {
   V(SpeculativeNumberLessThan)                \
   V(SpeculativeNumberLessThanOrEqual)
 
-#define CHECKED_OP_LIST(V)              \
-  V(CheckBounds, 2, 1)                  \
-  V(CheckHeapObject, 1, 1)              \
-  V(CheckIf, 1, 0)                      \
-  V(CheckInternalizedString, 1, 1)      \
-  V(CheckNumber, 1, 1)                  \
-  V(CheckReceiver, 1, 1)                \
-  V(CheckSmi, 1, 1)                     \
-  V(CheckString, 1, 1)                  \
-  V(CheckTaggedHole, 1, 1)              \
-  V(CheckedInt32Add, 2, 1)              \
-  V(CheckedInt32Sub, 2, 1)              \
-  V(CheckedInt32Div, 2, 1)              \
-  V(CheckedInt32Mod, 2, 1)              \
-  V(CheckedUint32Div, 2, 1)             \
-  V(CheckedUint32Mod, 2, 1)             \
-  V(CheckedUint32ToInt32, 1, 1)         \
-  V(CheckedUint32ToTaggedSigned, 1, 1)  \
-  V(CheckedInt32ToTaggedSigned, 1, 1)   \
-  V(CheckedTaggedSignedToInt32, 1, 1)   \
-  V(CheckedTaggedToTaggedSigned, 1, 1)  \
-  V(CheckedTaggedToTaggedPointer, 1, 1) \
-  V(CheckedTruncateTaggedToWord32, 1, 1)
+#define CHECKED_OP_LIST(V)             \
+  V(CheckBounds, 2, 1)                 \
+  V(CheckHeapObject, 1, 1)             \
+  V(CheckIf, 1, 0)                     \
+  V(CheckInternalizedString, 1, 1)     \
+  V(CheckNumber, 1, 1)                 \
+  V(CheckReceiver, 1, 1)               \
+  V(CheckSmi, 1, 1)                    \
+  V(CheckString, 1, 1)                 \
+  V(CheckSeqString, 1, 1)              \
+  V(CheckNonEmptyString, 1, 1)         \
+  V(CheckSymbol, 1, 1)                 \
+  V(CheckNotTaggedHole, 1, 1)          \
+  V(CheckedInt32Add, 2, 1)             \
+  V(CheckedInt32Sub, 2, 1)             \
+  V(CheckedInt32Div, 2, 1)             \
+  V(CheckedInt32Mod, 2, 1)             \
+  V(CheckedUint32Div, 2, 1)            \
+  V(CheckedUint32Mod, 2, 1)            \
+  V(CheckedUint32ToInt32, 1, 1)        \
+  V(CheckedUint32ToTaggedSigned, 1, 1) \
+  V(CheckedInt32ToTaggedSigned, 1, 1)  \
+  V(CheckedTaggedSignedToInt32, 1, 1)  \
+  V(CheckedTaggedToTaggedSigned, 1, 1) \
+  V(CheckedTaggedToTaggedPointer, 1, 1)
 
 struct SimplifiedOperatorGlobalCache final {
 #define PURE(Name, properties, value_input_count, control_input_count)     \
@@ -669,6 +669,20 @@ struct SimplifiedOperatorGlobalCache final {
   CheckedTaggedToFloat64Operator<CheckTaggedInputMode::kNumberOrOddball>
       kCheckedTaggedToFloat64NumberOrOddballOperator;
 
+  template <CheckTaggedInputMode kMode>
+  struct CheckedTruncateTaggedToWord32Operator final
+      : public Operator1<CheckTaggedInputMode> {
+    CheckedTruncateTaggedToWord32Operator()
+        : Operator1<CheckTaggedInputMode>(
+              IrOpcode::kCheckedTruncateTaggedToWord32,
+              Operator::kFoldable | Operator::kNoThrow,
+              "CheckedTruncateTaggedToWord32", 1, 1, 1, 1, 1, 0, kMode) {}
+  };
+  CheckedTruncateTaggedToWord32Operator<CheckTaggedInputMode::kNumber>
+      kCheckedTruncateTaggedToWord32NumberOperator;
+  CheckedTruncateTaggedToWord32Operator<CheckTaggedInputMode::kNumberOrOddball>
+      kCheckedTruncateTaggedToWord32NumberOrOddballOperator;
+
   template <CheckFloat64HoleMode kMode>
   struct CheckFloat64HoleNaNOperator final
       : public Operator1<CheckFloat64HoleMode> {
@@ -779,7 +793,6 @@ const Operator* SimplifiedOperatorBuilder::ChangeFloat64ToTagged(
       return &cache_.kChangeFloat64ToTaggedDontCheckForMinusZeroOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckedInt32Mul(
@@ -791,7 +804,6 @@ const Operator* SimplifiedOperatorBuilder::CheckedInt32Mul(
       return &cache_.kCheckedInt32MulDontCheckForMinusZeroOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckedFloat64ToInt32(
@@ -803,7 +815,6 @@ const Operator* SimplifiedOperatorBuilder::CheckedFloat64ToInt32(
       return &cache_.kCheckedFloat64ToInt32DontCheckForMinusZeroOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckedTaggedToInt32(
@@ -815,7 +826,6 @@ const Operator* SimplifiedOperatorBuilder::CheckedTaggedToInt32(
       return &cache_.kCheckedTaggedToInt32DontCheckForMinusZeroOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckedTaggedToFloat64(
@@ -827,7 +837,17 @@ const Operator* SimplifiedOperatorBuilder::CheckedTaggedToFloat64(
       return &cache_.kCheckedTaggedToFloat64NumberOrOddballOperator;
   }
   UNREACHABLE();
-  return nullptr;
+}
+
+const Operator* SimplifiedOperatorBuilder::CheckedTruncateTaggedToWord32(
+    CheckTaggedInputMode mode) {
+  switch (mode) {
+    case CheckTaggedInputMode::kNumber:
+      return &cache_.kCheckedTruncateTaggedToWord32NumberOperator;
+    case CheckTaggedInputMode::kNumberOrOddball:
+      return &cache_.kCheckedTruncateTaggedToWord32NumberOrOddballOperator;
+  }
+  UNREACHABLE();
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckMaps(CheckMapsFlags flags,
@@ -850,7 +870,6 @@ const Operator* SimplifiedOperatorBuilder::CheckFloat64Hole(
       return &cache_.kCheckFloat64HoleNeverReturnHoleOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::SpeculativeToNumber(
@@ -866,7 +885,6 @@ const Operator* SimplifiedOperatorBuilder::SpeculativeToNumber(
       return &cache_.kSpeculativeToNumberNumberOrOddballOperator;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::EnsureWritableFastElements() {
@@ -956,7 +974,6 @@ const Operator* SimplifiedOperatorBuilder::LoadBuffer(BufferAccess access) {
 #undef LOAD_BUFFER
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 
@@ -969,7 +986,6 @@ const Operator* SimplifiedOperatorBuilder::StoreBuffer(BufferAccess access) {
 #undef STORE_BUFFER
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 const Operator* SimplifiedOperatorBuilder::StringFromCodePoint(
@@ -981,7 +997,6 @@ const Operator* SimplifiedOperatorBuilder::StringFromCodePoint(
       return &cache_.kStringFromCodePointOperatorUTF32;
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 #define SPECULATIVE_NUMBER_BINOP(Name)                                        \

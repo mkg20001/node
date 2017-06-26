@@ -129,7 +129,12 @@ void MacroAssembler::LogicalMacro(const Register& rd,
     } else {
       // Immediate can't be encoded: synthesize using move immediate.
       Register temp = temps.AcquireSameSizeAs(rn);
-      Operand imm_operand = MoveImmediateForShiftedOp(temp, immediate);
+
+      // If the left-hand input is the stack pointer, we can't pre-shift the
+      // immediate, as the encoding won't allow the subsequent post shift.
+      PreShiftImmMode mode = rn.Is(csp) ? kNoShift : kAnyShift;
+      Operand imm_operand = MoveImmediateForShiftedOp(temp, immediate, mode);
+
       if (rd.Is(csp)) {
         // If rd is the stack pointer we cannot use it as the destination
         // register so we use the temp register as an intermediate again.
@@ -252,7 +257,7 @@ void MacroAssembler::Mov(const Register& rd,
   Register dst = (rd.IsSP()) ? temps.AcquireSameSizeAs(rd) : rd;
 
   if (operand.NeedsRelocation(this)) {
-    Ldr(dst, operand.immediate());
+    Ldr(dst, operand);
 
   } else if (operand.IsImmediate()) {
     // Call the macro assembler for generic immediates.
@@ -295,6 +300,171 @@ void MacroAssembler::Mov(const Register& rd,
   }
 }
 
+void MacroAssembler::Movi16bitHelper(const VRegister& vd, uint64_t imm) {
+  DCHECK(is_uint16(imm));
+  int byte1 = (imm & 0xff);
+  int byte2 = ((imm >> 8) & 0xff);
+  if (byte1 == byte2) {
+    movi(vd.Is64Bits() ? vd.V8B() : vd.V16B(), byte1);
+  } else if (byte1 == 0) {
+    movi(vd, byte2, LSL, 8);
+  } else if (byte2 == 0) {
+    movi(vd, byte1);
+  } else if (byte1 == 0xff) {
+    mvni(vd, ~byte2 & 0xff, LSL, 8);
+  } else if (byte2 == 0xff) {
+    mvni(vd, ~byte1 & 0xff);
+  } else {
+    UseScratchRegisterScope temps(this);
+    Register temp = temps.AcquireW();
+    movz(temp, imm);
+    dup(vd, temp);
+  }
+}
+
+void MacroAssembler::Movi32bitHelper(const VRegister& vd, uint64_t imm) {
+  DCHECK(is_uint32(imm));
+
+  uint8_t bytes[sizeof(imm)];
+  memcpy(bytes, &imm, sizeof(imm));
+
+  // All bytes are either 0x00 or 0xff.
+  {
+    bool all0orff = true;
+    for (int i = 0; i < 4; ++i) {
+      if ((bytes[i] != 0) && (bytes[i] != 0xff)) {
+        all0orff = false;
+        break;
+      }
+    }
+
+    if (all0orff == true) {
+      movi(vd.Is64Bits() ? vd.V1D() : vd.V2D(), ((imm << 32) | imm));
+      return;
+    }
+  }
+
+  // Of the 4 bytes, only one byte is non-zero.
+  for (int i = 0; i < 4; i++) {
+    if ((imm & (0xff << (i * 8))) == imm) {
+      movi(vd, bytes[i], LSL, i * 8);
+      return;
+    }
+  }
+
+  // Of the 4 bytes, only one byte is not 0xff.
+  for (int i = 0; i < 4; i++) {
+    uint32_t mask = ~(0xff << (i * 8));
+    if ((imm & mask) == mask) {
+      mvni(vd, ~bytes[i] & 0xff, LSL, i * 8);
+      return;
+    }
+  }
+
+  // Immediate is of the form 0x00MMFFFF.
+  if ((imm & 0xff00ffff) == 0x0000ffff) {
+    movi(vd, bytes[2], MSL, 16);
+    return;
+  }
+
+  // Immediate is of the form 0x0000MMFF.
+  if ((imm & 0xffff00ff) == 0x000000ff) {
+    movi(vd, bytes[1], MSL, 8);
+    return;
+  }
+
+  // Immediate is of the form 0xFFMM0000.
+  if ((imm & 0xff00ffff) == 0xff000000) {
+    mvni(vd, ~bytes[2] & 0xff, MSL, 16);
+    return;
+  }
+  // Immediate is of the form 0xFFFFMM00.
+  if ((imm & 0xffff00ff) == 0xffff0000) {
+    mvni(vd, ~bytes[1] & 0xff, MSL, 8);
+    return;
+  }
+
+  // Top and bottom 16-bits are equal.
+  if (((imm >> 16) & 0xffff) == (imm & 0xffff)) {
+    Movi16bitHelper(vd.Is64Bits() ? vd.V4H() : vd.V8H(), imm & 0xffff);
+    return;
+  }
+
+  // Default case.
+  {
+    UseScratchRegisterScope temps(this);
+    Register temp = temps.AcquireW();
+    Mov(temp, imm);
+    dup(vd, temp);
+  }
+}
+
+void MacroAssembler::Movi64bitHelper(const VRegister& vd, uint64_t imm) {
+  // All bytes are either 0x00 or 0xff.
+  {
+    bool all0orff = true;
+    for (int i = 0; i < 8; ++i) {
+      int byteval = (imm >> (i * 8)) & 0xff;
+      if (byteval != 0 && byteval != 0xff) {
+        all0orff = false;
+        break;
+      }
+    }
+    if (all0orff == true) {
+      movi(vd, imm);
+      return;
+    }
+  }
+
+  // Top and bottom 32-bits are equal.
+  if (((imm >> 32) & 0xffffffff) == (imm & 0xffffffff)) {
+    Movi32bitHelper(vd.Is64Bits() ? vd.V2S() : vd.V4S(), imm & 0xffffffff);
+    return;
+  }
+
+  // Default case.
+  {
+    UseScratchRegisterScope temps(this);
+    Register temp = temps.AcquireX();
+    Mov(temp, imm);
+    if (vd.Is1D()) {
+      mov(vd.D(), 0, temp);
+    } else {
+      dup(vd.V2D(), temp);
+    }
+  }
+}
+
+void MacroAssembler::Movi(const VRegister& vd, uint64_t imm, Shift shift,
+                          int shift_amount) {
+  DCHECK(allow_macro_instructions_);
+  if (shift_amount != 0 || shift != LSL) {
+    movi(vd, imm, shift, shift_amount);
+  } else if (vd.Is8B() || vd.Is16B()) {
+    // 8-bit immediate.
+    DCHECK(is_uint8(imm));
+    movi(vd, imm);
+  } else if (vd.Is4H() || vd.Is8H()) {
+    // 16-bit immediate.
+    Movi16bitHelper(vd, imm);
+  } else if (vd.Is2S() || vd.Is4S()) {
+    // 32-bit immediate.
+    Movi32bitHelper(vd, imm);
+  } else {
+    // 64-bit immediate.
+    Movi64bitHelper(vd, imm);
+  }
+}
+
+void MacroAssembler::Movi(const VRegister& vd, uint64_t hi, uint64_t lo) {
+  // TODO(all): Move 128-bit values in a more efficient way.
+  DCHECK(vd.Is128Bits());
+  UseScratchRegisterScope temps(this);
+  Movi(vd.V2D(), lo);
+  Register temp = temps.AcquireX();
+  Mov(temp, hi);
+  Ins(vd.V2D(), 1, temp);
+}
 
 void MacroAssembler::Mvn(const Register& rd, const Operand& operand) {
   DCHECK(allow_macro_instructions_);
@@ -437,17 +607,23 @@ bool MacroAssembler::TryOneInstrMoveImmediate(const Register& dst,
   return false;
 }
 
-
 Operand MacroAssembler::MoveImmediateForShiftedOp(const Register& dst,
-                                                  int64_t imm) {
+                                                  int64_t imm,
+                                                  PreShiftImmMode mode) {
   int reg_size = dst.SizeInBits();
-
   // Encode the immediate in a single move instruction, if possible.
   if (TryOneInstrMoveImmediate(dst, imm)) {
     // The move was successful; nothing to do here.
   } else {
     // Pre-shift the immediate to the least-significant bits of the register.
     int shift_low = CountTrailingZeros(imm, reg_size);
+    if (mode == kLimitShiftForSP) {
+      // When applied to the stack pointer, the subsequent arithmetic operation
+      // can use the extend form to shift left by a maximum of four bits. Right
+      // shifts are not allowed, so we filter them out later before the new
+      // immediate is tested.
+      shift_low = std::min(shift_low, 4);
+    }
     int64_t imm_low = imm >> shift_low;
 
     // Pre-shift the immediate to the most-significant bits of the register. We
@@ -456,13 +632,13 @@ Operand MacroAssembler::MoveImmediateForShiftedOp(const Register& dst,
     // If this new immediate is encodable, the set bits will be eliminated by
     // the post shift on the following instruction.
     int shift_high = CountLeadingZeros(imm, reg_size);
-    int64_t imm_high = (imm << shift_high) | ((1 << shift_high) - 1);
+    int64_t imm_high = (imm << shift_high) | ((INT64_C(1) << shift_high) - 1);
 
-    if (TryOneInstrMoveImmediate(dst, imm_low)) {
+    if ((mode != kNoShift) && TryOneInstrMoveImmediate(dst, imm_low)) {
       // The new immediate has been moved into the destination's low bits:
       // return a new leftward-shifting operand.
       return Operand(dst, LSL, shift_low);
-    } else if (TryOneInstrMoveImmediate(dst, imm_high)) {
+    } else if ((mode == kAnyShift) && TryOneInstrMoveImmediate(dst, imm_high)) {
       // The new immediate has been moved into the destination's high bits:
       // return a new rightward-shifting operand.
       return Operand(dst, LSR, shift_high);
@@ -498,8 +674,21 @@ void MacroAssembler::AddSubMacro(const Register& rd,
     UseScratchRegisterScope temps(this);
     Register temp = temps.AcquireSameSizeAs(rn);
     if (operand.IsImmediate()) {
+      PreShiftImmMode mode = kAnyShift;
+
+      // If the destination or source register is the stack pointer, we can
+      // only pre-shift the immediate right by values supported in the add/sub
+      // extend encoding.
+      if (rd.Is(csp)) {
+        // If the destination is SP and flags will be set, we can't pre-shift
+        // the immediate at all.
+        mode = (S == SetFlags) ? kNoShift : kLimitShiftForSP;
+      } else if (rn.Is(csp)) {
+        mode = kLimitShiftForSP;
+      }
+
       Operand imm_operand =
-          MoveImmediateForShiftedOp(temp, operand.ImmediateValue());
+          MoveImmediateForShiftedOp(temp, operand.ImmediateValue(), mode);
       AddSub(rd, rn, imm_operand, S, op);
     } else {
       Mov(temp, operand);
@@ -566,7 +755,7 @@ void MacroAssembler::LoadStoreMacro(const CPURegister& rt,
                                     const MemOperand& addr,
                                     LoadStoreOp op) {
   int64_t offset = addr.offset();
-  LSDataSize size = CalcLSDataSize(op);
+  unsigned size = CalcLSDataSize(op);
 
   // Check if an immediate offset fits in the immediate field of the
   // appropriate instruction. If not, emit two instructions to perform
@@ -601,7 +790,7 @@ void MacroAssembler::LoadStorePairMacro(const CPURegister& rt,
   DCHECK(!addr.IsRegisterOffset());
 
   int64_t offset = addr.offset();
-  LSDataSize size = CalcLSPairDataSize(op);
+  unsigned size = CalcLSPairDataSize(op);
 
   // Check if the offset fits in the immediate field of the appropriate
   // instruction. If not, emit two instructions to perform the operation.
@@ -929,8 +1118,7 @@ void MacroAssembler::Pop(const CPURegister& dst0, const CPURegister& dst1,
   PopPostamble(count, size);
 }
 
-
-void MacroAssembler::Push(const Register& src0, const FPRegister& src1) {
+void MacroAssembler::Push(const Register& src0, const VRegister& src1) {
   int size = src0.SizeInBytes() + src1.SizeInBytes();
 
   PushPreamble(size);
@@ -1397,9 +1585,8 @@ void MacroAssembler::AssertFPCRState(Register fpcr) {
   }
 }
 
-
-void MacroAssembler::CanonicalizeNaN(const FPRegister& dst,
-                                     const FPRegister& src) {
+void MacroAssembler::CanonicalizeNaN(const VRegister& dst,
+                                     const VRegister& src) {
   AssertFPCRState();
 
   // Subtracting 0.0 preserves all inputs except for signalling NaNs, which
@@ -1618,6 +1805,17 @@ void MacroAssembler::AssertNotSmi(Register object, BailoutReason reason) {
   }
 }
 
+void MacroAssembler::AssertFixedArray(Register object) {
+  if (emit_debug_code()) {
+    AssertNotSmi(object, kOperandIsASmiAndNotAFixedArray);
+
+    UseScratchRegisterScope temps(this);
+    Register temp = temps.AcquireX();
+
+    CompareObjectType(object, temp, temp, FIXED_ARRAY_TYPE);
+    Check(eq, kOperandIsNotAFixedArray);
+  }
+}
 
 void MacroAssembler::AssertFunction(Register object) {
   if (emit_debug_code()) {
@@ -1699,9 +1897,9 @@ void MacroAssembler::AssertPositiveOrZero(Register value) {
   }
 }
 
-void MacroAssembler::CallStub(CodeStub* stub, TypeFeedbackId ast_id) {
+void MacroAssembler::CallStub(CodeStub* stub) {
   DCHECK(AllowThisStubCall(stub));  // Stub calls are not allowed in some stubs.
-  Call(stub->GetCode(), RelocInfo::CODE_TARGET, ast_id);
+  Call(stub->GetCode(), RelocInfo::CODE_TARGET);
 }
 
 
@@ -1791,14 +1989,13 @@ void MacroAssembler::CallCFunction(ExternalReference function,
   CallCFunction(temp, num_of_reg_args, num_of_double_args);
 }
 
+static const int kRegisterPassedArguments = 8;
 
 void MacroAssembler::CallCFunction(Register function,
                                    int num_of_reg_args,
                                    int num_of_double_args) {
+  DCHECK_LE(num_of_reg_args + num_of_double_args, kMaxCParameters);
   DCHECK(has_frame());
-  // We can pass 8 integer arguments in registers. If we need to pass more than
-  // that, we'll need to implement support for passing them on the stack.
-  DCHECK(num_of_reg_args <= 8);
 
   // If we're passing doubles, we're limited to the following prototypes
   // (defined by ExternalReference::Type):
@@ -1811,6 +2008,10 @@ void MacroAssembler::CallCFunction(Register function,
     DCHECK((num_of_double_args + num_of_reg_args) <= 2);
   }
 
+  // We rely on the frame alignment being 16 bytes, which means we never need
+  // to align the CSP by an unknown number of bytes and we always know the delta
+  // between the stack pointer and the frame pointer.
+  DCHECK(ActivationFrameAlignment() == 16);
 
   // If the stack pointer is not csp, we need to derive an aligned csp from the
   // current stack pointer.
@@ -1819,16 +2020,18 @@ void MacroAssembler::CallCFunction(Register function,
     AssertStackConsistency();
 
     int sp_alignment = ActivationFrameAlignment();
-    // The ABI mandates at least 16-byte alignment.
-    DCHECK(sp_alignment >= 16);
-    DCHECK(base::bits::IsPowerOfTwo32(sp_alignment));
-
     // The current stack pointer is a callee saved register, and is preserved
     // across the call.
     DCHECK(kCalleeSaved.IncludesAliasOf(old_stack_pointer));
 
-    // Align and synchronize the system stack pointer with jssp.
-    Bic(csp, old_stack_pointer, sp_alignment - 1);
+    // If more than eight arguments are passed to the function, we expect the
+    // ninth argument onwards to have been placed on the csp-based stack
+    // already. We assume csp already points to the last stack-passed argument
+    // in that case.
+    // Otherwise, align and synchronize the system stack pointer with jssp.
+    if (num_of_reg_args <= kRegisterPassedArguments) {
+      Bic(csp, old_stack_pointer, sp_alignment - 1);
+    }
     SetStackPointer(csp);
   }
 
@@ -1836,19 +2039,39 @@ void MacroAssembler::CallCFunction(Register function,
   // so the return address in the link register stays correct.
   Call(function);
 
-  if (!csp.Is(old_stack_pointer)) {
+  if (csp.Is(old_stack_pointer)) {
+    if (num_of_reg_args > kRegisterPassedArguments) {
+      // Drop the register passed arguments.
+      int claim_slots = RoundUp(num_of_reg_args - kRegisterPassedArguments, 2);
+      Drop(claim_slots);
+    }
+  } else {
+    DCHECK(jssp.Is(old_stack_pointer));
     if (emit_debug_code()) {
-      // Because the stack pointer must be aligned on a 16-byte boundary, the
-      // aligned csp can be up to 12 bytes below the jssp. This is the case
-      // where we only pushed one W register on top of an aligned jssp.
       UseScratchRegisterScope temps(this);
       Register temp = temps.AcquireX();
-      DCHECK(ActivationFrameAlignment() == 16);
-      Sub(temp, csp, old_stack_pointer);
-      // We want temp <= 0 && temp >= -12.
-      Cmp(temp, 0);
-      Ccmp(temp, -12, NFlag, le);
-      Check(ge, kTheStackWasCorruptedByMacroAssemblerCall);
+
+      if (num_of_reg_args > kRegisterPassedArguments) {
+        // We don't need to drop stack arguments, as the stack pointer will be
+        // jssp when returning from this function. However, in debug builds, we
+        // can check that jssp is as expected.
+        int claim_slots =
+            RoundUp(num_of_reg_args - kRegisterPassedArguments, 2);
+
+        // Check jssp matches the previous value on the stack.
+        Ldr(temp, MemOperand(csp, claim_slots * kPointerSize));
+        Cmp(jssp, temp);
+        Check(eq, kTheStackWasCorruptedByMacroAssemblerCall);
+      } else {
+        // Because the stack pointer must be aligned on a 16-byte boundary, the
+        // aligned csp can be up to 12 bytes below the jssp. This is the case
+        // where we only pushed one W register on top of an aligned jssp.
+        Sub(temp, csp, old_stack_pointer);
+        // We want temp <= 0 && temp >= -12.
+        Cmp(temp, 0);
+        Ccmp(temp, -12, NFlag, le);
+        Check(ge, kTheStackWasCorruptedByMacroAssemblerCall);
+      }
     }
     SetStackPointer(old_stack_pointer);
   }
@@ -1950,26 +2173,18 @@ void MacroAssembler::Call(Address target, RelocInfo::Mode rmode) {
 #endif
 }
 
-
-void MacroAssembler::Call(Handle<Code> code,
-                          RelocInfo::Mode rmode,
-                          TypeFeedbackId ast_id) {
+void MacroAssembler::Call(Handle<Code> code, RelocInfo::Mode rmode) {
 #ifdef DEBUG
   Label start_call;
   Bind(&start_call);
 #endif
-
-  if ((rmode == RelocInfo::CODE_TARGET) && (!ast_id.IsNone())) {
-    SetRecordedAstId(ast_id);
-    rmode = RelocInfo::CODE_TARGET_WITH_ID;
-  }
 
   AllowDeferredHandleDereference embedding_raw_address;
   Call(reinterpret_cast<Address>(code.location()), rmode);
 
 #ifdef DEBUG
   // Check the size of the code generated.
-  AssertSizeOfCodeGeneratedSince(&start_call, CallSize(code, rmode, ast_id));
+  AssertSizeOfCodeGeneratedSince(&start_call, CallSize(code, rmode));
 #endif
 }
 
@@ -1999,12 +2214,8 @@ int MacroAssembler::CallSize(Address target, RelocInfo::Mode rmode) {
   }
 }
 
-
-int MacroAssembler::CallSize(Handle<Code> code,
-                             RelocInfo::Mode rmode,
-                             TypeFeedbackId ast_id) {
+int MacroAssembler::CallSize(Handle<Code> code, RelocInfo::Mode rmode) {
   USE(code);
-  USE(ast_id);
 
   // Addresses always have 64 bits, so we shouldn't encounter NONE32.
   DCHECK(rmode != RelocInfo::NONE32);
@@ -2051,10 +2262,8 @@ void MacroAssembler::JumpIfNotHeapNumber(Register object,
   JumpIfNotRoot(temp, Heap::kHeapNumberMapRootIndex, on_not_heap_number);
 }
 
-
-void MacroAssembler::TryRepresentDoubleAsInt(Register as_int,
-                                             FPRegister value,
-                                             FPRegister scratch_d,
+void MacroAssembler::TryRepresentDoubleAsInt(Register as_int, VRegister value,
+                                             VRegister scratch_d,
                                              Label* on_successful_conversion,
                                              Label* on_failed_conversion) {
   // Convert to an int and back again, then compare with the original value.
@@ -2668,14 +2877,14 @@ void MacroAssembler::LeaveFrame(StackFrame::Type type) {
 
 
 void MacroAssembler::ExitFramePreserveFPRegs() {
-  PushCPURegList(kCallerSavedFP);
+  PushCPURegList(kCallerSavedV);
 }
 
 
 void MacroAssembler::ExitFrameRestoreFPRegs() {
   // Read the registers from the stack without popping them. The stack pointer
   // will be reset as part of the unwinding process.
-  CPURegList saved_fp_regs = kCallerSavedFP;
+  CPURegList saved_fp_regs = kCallerSavedV;
   DCHECK(saved_fp_regs.Count() % 2 == 0);
 
   int offset = ExitFrameConstants::kLastExitFrameField;
@@ -2727,11 +2936,11 @@ void MacroAssembler::EnterExitFrame(bool save_doubles, const Register& scratch,
   STATIC_ASSERT((-3 * kPointerSize) == ExitFrameConstants::kCodeOffset);
 
   // Save the frame pointer and context pointer in the top frame.
-  Mov(scratch, Operand(ExternalReference(Isolate::kCEntryFPAddress,
+  Mov(scratch, Operand(ExternalReference(IsolateAddressId::kCEntryFPAddress,
                                          isolate())));
   Str(fp, MemOperand(scratch));
-  Mov(scratch, Operand(ExternalReference(Isolate::kContextAddress,
-                                         isolate())));
+  Mov(scratch,
+      Operand(ExternalReference(IsolateAddressId::kContextAddress, isolate())));
   Str(cp, MemOperand(scratch));
 
   STATIC_ASSERT((-3 * kPointerSize) == ExitFrameConstants::kLastExitFrameField);
@@ -2787,19 +2996,19 @@ void MacroAssembler::LeaveExitFrame(bool restore_doubles,
 
   // Restore the context pointer from the top frame.
   if (restore_context) {
-    Mov(scratch, Operand(ExternalReference(Isolate::kContextAddress,
+    Mov(scratch, Operand(ExternalReference(IsolateAddressId::kContextAddress,
                                            isolate())));
     Ldr(cp, MemOperand(scratch));
   }
 
   if (emit_debug_code()) {
     // Also emit debug code to clear the cp in the top frame.
-    Mov(scratch, Operand(ExternalReference(Isolate::kContextAddress,
+    Mov(scratch, Operand(ExternalReference(IsolateAddressId::kContextAddress,
                                            isolate())));
     Str(xzr, MemOperand(scratch));
   }
   // Clear the frame pointer from the top frame.
-  Mov(scratch, Operand(ExternalReference(Isolate::kCEntryFPAddress,
+  Mov(scratch, Operand(ExternalReference(IsolateAddressId::kCEntryFPAddress,
                                          isolate())));
   Str(xzr, MemOperand(scratch));
 
@@ -2878,7 +3087,7 @@ void MacroAssembler::PushStackHandler() {
   // (See JSEntryStub::GenerateBody().)
 
   // Link the current handler as the next handler.
-  Mov(x11, ExternalReference(Isolate::kHandlerAddress, isolate()));
+  Mov(x11, ExternalReference(IsolateAddressId::kHandlerAddress, isolate()));
   Ldr(x10, MemOperand(x11));
   Push(x10);
 
@@ -2890,7 +3099,7 @@ void MacroAssembler::PushStackHandler() {
 void MacroAssembler::PopStackHandler() {
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0);
   Pop(x10);
-  Mov(x11, ExternalReference(Isolate::kHandlerAddress, isolate()));
+  Mov(x11, ExternalReference(IsolateAddressId::kHandlerAddress, isolate()));
   Drop(StackHandlerConstants::kSize - kXRegSize, kByteSizeInBytes);
   Str(x10, MemOperand(x11));
 }
@@ -3154,7 +3363,7 @@ void MacroAssembler::AllocateHeapNumber(Register result,
   if (!heap_number_map.IsValid()) {
     // If we have a valid value register, use the same type of register to store
     // the map so we can use STP to store both in one instruction.
-    if (value.IsValid() && value.IsFPRegister()) {
+    if (value.IsValid() && value.IsVRegister()) {
       heap_number_map = temps.AcquireD();
     } else {
       heap_number_map = scratch1;
@@ -3163,7 +3372,7 @@ void MacroAssembler::AllocateHeapNumber(Register result,
   }
   if (emit_debug_code()) {
     Register map;
-    if (heap_number_map.IsFPRegister()) {
+    if (heap_number_map.IsVRegister()) {
       map = scratch1;
       Fmov(map, DoubleRegister(heap_number_map));
     } else {
@@ -3625,14 +3834,14 @@ void MacroAssembler::PushSafepointRegisters() {
 void MacroAssembler::PushSafepointRegistersAndDoubles() {
   PushSafepointRegisters();
   PushCPURegList(CPURegList(
-      CPURegister::kFPRegister, kDRegSizeInBits,
+      CPURegister::kVRegister, kDRegSizeInBits,
       RegisterConfiguration::Crankshaft()->allocatable_double_codes_mask()));
 }
 
 
 void MacroAssembler::PopSafepointRegistersAndDoubles() {
   PopCPURegList(CPURegList(
-      CPURegister::kFPRegister, kDRegSizeInBits,
+      CPURegister::kVRegister, kDRegSizeInBits,
       RegisterConfiguration::Crankshaft()->allocatable_double_codes_mask()));
   PopSafepointRegisters();
 }
@@ -3671,7 +3880,6 @@ int MacroAssembler::SafepointRegisterStackIndex(int reg_code) {
   } else {
     // This register has no safepoint register slot.
     UNREACHABLE();
-    return -1;
   }
 }
 
@@ -3733,7 +3941,7 @@ void MacroAssembler::RecordWriteField(
   Add(scratch, object, offset - kHeapObjectTag);
   if (emit_debug_code()) {
     Label ok;
-    Tst(scratch, (1 << kPointerSizeLog2) - 1);
+    Tst(scratch, kPointerSize - 1);
     B(eq, &ok);
     Abort(kUnalignedCellInWriteBarrier);
     Bind(&ok);
@@ -4184,7 +4392,7 @@ void MacroAssembler::PrintfNoPreserve(const char * format,
   static const CPURegList kPCSVarargs =
       CPURegList(CPURegister::kRegister, kXRegSizeInBits, 1, arg_count);
   static const CPURegList kPCSVarargsFP =
-      CPURegList(CPURegister::kFPRegister, kDRegSizeInBits, 0, arg_count - 1);
+      CPURegList(CPURegister::kVRegister, kDRegSizeInBits, 0, arg_count - 1);
 
   // We can use caller-saved registers as scratch values, except for the
   // arguments and the PCS registers where they might need to go.
@@ -4193,7 +4401,7 @@ void MacroAssembler::PrintfNoPreserve(const char * format,
   tmp_list.Remove(kPCSVarargs);
   tmp_list.Remove(arg0, arg1, arg2, arg3);
 
-  CPURegList fp_tmp_list = kCallerSavedFP;
+  CPURegList fp_tmp_list = kCallerSavedV;
   fp_tmp_list.Remove(kPCSVarargsFP);
   fp_tmp_list.Remove(arg0, arg1, arg2, arg3);
 
@@ -4218,7 +4426,7 @@ void MacroAssembler::PrintfNoPreserve(const char * format,
       // We might only need a W register here. We need to know the size of the
       // argument so we can properly encode it for the simulator call.
       if (args[i].Is32Bits()) pcs[i] = pcs[i].W();
-    } else if (args[i].IsFPRegister()) {
+    } else if (args[i].IsVRegister()) {
       // In C, floats are always cast to doubles for varargs calls.
       pcs[i] = pcs_varargs_fp.PopLowestIndex().D();
     } else {
@@ -4240,8 +4448,8 @@ void MacroAssembler::PrintfNoPreserve(const char * format,
         Mov(new_arg, old_arg);
         args[i] = new_arg;
       } else {
-        FPRegister old_arg = FPRegister(args[i]);
-        FPRegister new_arg = temps.AcquireSameSizeAs(old_arg);
+        VRegister old_arg = VRegister(args[i]);
+        VRegister new_arg = temps.AcquireSameSizeAs(old_arg);
         Fmov(new_arg, old_arg);
         args[i] = new_arg;
       }
@@ -4255,11 +4463,11 @@ void MacroAssembler::PrintfNoPreserve(const char * format,
     if (pcs[i].IsRegister()) {
       Mov(Register(pcs[i]), Register(args[i]), kDiscardForSameWReg);
     } else {
-      DCHECK(pcs[i].IsFPRegister());
+      DCHECK(pcs[i].IsVRegister());
       if (pcs[i].SizeInBytes() == args[i].SizeInBytes()) {
-        Fmov(FPRegister(pcs[i]), FPRegister(args[i]));
+        Fmov(VRegister(pcs[i]), VRegister(args[i]));
       } else {
-        Fcvt(FPRegister(pcs[i]), FPRegister(args[i]));
+        Fcvt(VRegister(pcs[i]), VRegister(args[i]));
       }
     }
   }
@@ -4347,11 +4555,11 @@ void MacroAssembler::Printf(const char * format,
   // If csp is the stack pointer, PushCPURegList asserts that the size of each
   // list is a multiple of 16 bytes.
   PushCPURegList(kCallerSaved);
-  PushCPURegList(kCallerSavedFP);
+  PushCPURegList(kCallerSavedV);
 
   // We can use caller-saved registers as scratch values (except for argN).
   CPURegList tmp_list = kCallerSaved;
-  CPURegList fp_tmp_list = kCallerSavedFP;
+  CPURegList fp_tmp_list = kCallerSavedV;
   tmp_list.Remove(arg0, arg1, arg2, arg3);
   fp_tmp_list.Remove(arg0, arg1, arg2, arg3);
   TmpList()->set_list(tmp_list.list());
@@ -4370,7 +4578,7 @@ void MacroAssembler::Printf(const char * format,
       // to PrintfNoPreserve as an argument.
       Register arg_sp = temps.AcquireX();
       Add(arg_sp, StackPointer(),
-          kCallerSaved.TotalSizeInBytes() + kCallerSavedFP.TotalSizeInBytes());
+          kCallerSaved.TotalSizeInBytes() + kCallerSavedV.TotalSizeInBytes());
       if (arg0_sp) arg0 = Register::Create(arg_sp.code(), arg0.SizeInBits());
       if (arg1_sp) arg1 = Register::Create(arg_sp.code(), arg1.SizeInBits());
       if (arg2_sp) arg2 = Register::Create(arg_sp.code(), arg2.SizeInBits());
@@ -4394,7 +4602,7 @@ void MacroAssembler::Printf(const char * format,
     }
   }
 
-  PopCPURegList(kCallerSavedFP);
+  PopCPURegList(kCallerSavedV);
   PopCPURegList(kCallerSaved);
 
   TmpList()->set_list(old_tmp_list);
@@ -4508,10 +4716,9 @@ Register UseScratchRegisterScope::AcquireSameSizeAs(const Register& reg) {
   return Register::Create(code, reg.SizeInBits());
 }
 
-
-FPRegister UseScratchRegisterScope::AcquireSameSizeAs(const FPRegister& reg) {
+VRegister UseScratchRegisterScope::AcquireSameSizeAs(const VRegister& reg) {
   int code = AcquireNextAvailable(availablefp_).code();
-  return FPRegister::Create(code, reg.SizeInBits());
+  return VRegister::Create(code, reg.SizeInBits());
 }
 
 

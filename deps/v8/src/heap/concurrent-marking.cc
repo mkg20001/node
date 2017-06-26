@@ -7,9 +7,12 @@
 #include <stack>
 #include <unordered_map>
 
+#include "src/heap/concurrent-marking-deque.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap.h"
 #include "src/heap/marking.h"
+#include "src/heap/objects-visiting-inl.h"
+#include "src/heap/objects-visiting.h"
 #include "src/isolate.h"
 #include "src/locked-queue-inl.h"
 #include "src/utils-inl.h"
@@ -19,128 +22,302 @@
 namespace v8 {
 namespace internal {
 
-class ConcurrentMarkingMarkbits {
+// Helper class for storing in-object slot addresses and values.
+class SlotSnapshot {
  public:
-  ConcurrentMarkingMarkbits() {}
-  ~ConcurrentMarkingMarkbits() {
-    for (auto chunk_bitmap : bitmap_) {
-      FreeBitmap(chunk_bitmap.second);
-    }
+  SlotSnapshot() : number_of_slots_(0) {}
+  int number_of_slots() const { return number_of_slots_; }
+  Object** slot(int i) const { return snapshot_[i].first; }
+  Object* value(int i) const { return snapshot_[i].second; }
+  void clear() { number_of_slots_ = 0; }
+  void add(Object** slot, Object* value) {
+    snapshot_[number_of_slots_].first = slot;
+    snapshot_[number_of_slots_].second = value;
+    ++number_of_slots_;
   }
-  bool Mark(HeapObject* obj) {
-    Address address = obj->address();
-    MemoryChunk* chunk = MemoryChunk::FromAddress(address);
-    if (bitmap_.count(chunk) == 0) {
-      bitmap_[chunk] = AllocateBitmap();
-    }
-    MarkBit mark_bit =
-        bitmap_[chunk]->MarkBitFromIndex(chunk->AddressToMarkbitIndex(address));
-    if (mark_bit.Get()) return false;
-    mark_bit.Set();
-    return true;
-  }
-
-  Bitmap* AllocateBitmap() {
-    return static_cast<Bitmap*>(calloc(1, Bitmap::kSize));
-  }
-
-  void FreeBitmap(Bitmap* bitmap) { free(bitmap); }
 
  private:
-  std::unordered_map<MemoryChunk*, Bitmap*> bitmap_;
+  static const int kMaxSnapshotSize = JSObject::kMaxInstanceSize / kPointerSize;
+  int number_of_slots_;
+  std::pair<Object**, Object*> snapshot_[kMaxSnapshotSize];
+  DISALLOW_COPY_AND_ASSIGN(SlotSnapshot);
 };
 
-class ConcurrentMarkingVisitor : public ObjectVisitor {
+class ConcurrentMarkingVisitor final
+    : public HeapVisitor<int, ConcurrentMarkingVisitor> {
  public:
-  ConcurrentMarkingVisitor() : bytes_marked_(0) {}
+  using BaseClass = HeapVisitor<int, ConcurrentMarkingVisitor>;
 
-  void VisitPointers(Object** start, Object** end) override {
+  explicit ConcurrentMarkingVisitor(ConcurrentMarkingDeque* deque)
+      : deque_(deque) {}
+
+  bool ShouldVisit(HeapObject* object) override {
+    return ObjectMarking::GreyToBlack<AccessMode::ATOMIC>(
+        object, marking_state(object));
+  }
+
+  void VisitPointers(HeapObject* host, Object** start, Object** end) override {
     for (Object** p = start; p < end; p++) {
-      if (!(*p)->IsHeapObject()) continue;
-      MarkObject(HeapObject::cast(*p));
+      Object* object = reinterpret_cast<Object*>(
+          base::Relaxed_Load(reinterpret_cast<const base::AtomicWord*>(p)));
+      if (!object->IsHeapObject()) continue;
+      MarkObject(HeapObject::cast(object));
     }
   }
 
-  void MarkObject(HeapObject* obj) {
-    if (markbits_.Mark(obj)) {
-      bytes_marked_ += obj->Size();
-      marking_stack_.push(obj);
+  void VisitPointersInSnapshot(const SlotSnapshot& snapshot) {
+    for (int i = 0; i < snapshot.number_of_slots(); i++) {
+      Object* object = snapshot.value(i);
+      if (!object->IsHeapObject()) continue;
+      MarkObject(HeapObject::cast(object));
     }
   }
 
-  void MarkTransitively() {
-    while (!marking_stack_.empty()) {
-      HeapObject* obj = marking_stack_.top();
-      marking_stack_.pop();
-      obj->Iterate(this);
-    }
+  void VisitCodeEntry(JSFunction* host, Address entry_address) override {
+    Address code_entry = base::AsAtomicWord::Relaxed_Load(
+        reinterpret_cast<Address*>(entry_address));
+    Object* code = Code::GetObjectFromCodeEntry(code_entry);
+    VisitPointer(host, &code);
   }
 
-  size_t bytes_marked() { return bytes_marked_; }
+  // ===========================================================================
+  // JS object =================================================================
+  // ===========================================================================
+
+  int VisitJSObject(Map* map, JSObject* object) override {
+    int size = JSObject::BodyDescriptor::SizeOf(map, object);
+    const SlotSnapshot& snapshot = MakeSlotSnapshot(map, object, size);
+    if (!ShouldVisit(object)) return 0;
+    VisitPointersInSnapshot(snapshot);
+    return size;
+  }
+
+  int VisitJSObjectFast(Map* map, JSObject* object) override {
+    return VisitJSObject(map, object);
+  }
+
+  int VisitJSApiObject(Map* map, JSObject* object) override {
+    return VisitJSObject(map, object);
+  }
+
+  // ===========================================================================
+  // Fixed array object ========================================================
+  // ===========================================================================
+
+  int VisitFixedArray(Map* map, FixedArray* object) override {
+    int length = object->synchronized_length();
+    int size = FixedArray::SizeFor(length);
+    if (!ShouldVisit(object)) return 0;
+    VisitMapPointer(object, object->map_slot());
+    FixedArray::BodyDescriptor::IterateBody(object, size, this);
+    return size;
+  }
+
+  // ===========================================================================
+  // Code object ===============================================================
+  // ===========================================================================
+
+  int VisitCode(Map* map, Code* object) override {
+    deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    return 0;
+  }
+
+  // ===========================================================================
+  // Objects with weak fields and/or side-effectiful visitation.
+  // ===========================================================================
+
+  int VisitBytecodeArray(Map* map, BytecodeArray* object) override {
+    if (ObjectMarking::IsGrey<AccessMode::ATOMIC>(object,
+                                                  marking_state(object))) {
+      int size = BytecodeArray::BodyDescriptorWeak::SizeOf(map, object);
+      VisitMapPointer(object, object->map_slot());
+      BytecodeArray::BodyDescriptorWeak::IterateBody(object, size, this);
+      // Aging of bytecode arrays is done on the main thread.
+      deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    }
+    return 0;
+  }
+
+  int VisitJSFunction(Map* map, JSFunction* object) override {
+    if (!ShouldVisit(object)) return 0;
+    int size = JSFunction::BodyDescriptorWeak::SizeOf(map, object);
+    VisitMapPointer(object, object->map_slot());
+    JSFunction::BodyDescriptorWeak::IterateBody(object, size, this);
+    return size;
+  }
+
+  int VisitMap(Map* map, Map* object) override {
+    // TODO(ulan): implement iteration of strong fields.
+    deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    return 0;
+  }
+
+  int VisitNativeContext(Map* map, Context* object) override {
+    if (ObjectMarking::IsGrey<AccessMode::ATOMIC>(object,
+                                                  marking_state(object))) {
+      int size = Context::BodyDescriptorWeak::SizeOf(map, object);
+      VisitMapPointer(object, object->map_slot());
+      Context::BodyDescriptorWeak::IterateBody(object, size, this);
+      // TODO(ulan): implement proper weakness for normalized map cache
+      // and remove this bailout.
+      deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    }
+    return 0;
+  }
+
+  int VisitSharedFunctionInfo(Map* map, SharedFunctionInfo* object) override {
+    if (ObjectMarking::IsGrey<AccessMode::ATOMIC>(object,
+                                                  marking_state(object))) {
+      int size = SharedFunctionInfo::BodyDescriptorWeak::SizeOf(map, object);
+      VisitMapPointer(object, object->map_slot());
+      SharedFunctionInfo::BodyDescriptorWeak::IterateBody(object, size, this);
+      // Resetting of IC age counter is done on the main thread.
+      deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    }
+    return 0;
+  }
+
+  int VisitTransitionArray(Map* map, TransitionArray* object) override {
+    // TODO(ulan): implement iteration of strong fields.
+    deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    return 0;
+  }
+
+  int VisitWeakCell(Map* map, WeakCell* object) override {
+    // TODO(ulan): implement iteration of strong fields.
+    deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    return 0;
+  }
+
+  int VisitJSWeakCollection(Map* map, JSWeakCollection* object) override {
+    // TODO(ulan): implement iteration of strong fields.
+    deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+    return 0;
+  }
+
+  void MarkObject(HeapObject* object) {
+#ifdef THREAD_SANITIZER
+    // Perform a dummy acquire load to tell TSAN that there is no data race
+    // in mark-bit initialization. See MemoryChunk::Initialize for the
+    // corresponding release store.
+    MemoryChunk* chunk = MemoryChunk::FromAddress(object->address());
+    CHECK_NOT_NULL(chunk->synchronized_heap());
+#endif
+    if (ObjectMarking::WhiteToGrey<AccessMode::ATOMIC>(object,
+                                                       marking_state(object))) {
+      deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kShared);
+    }
+  }
 
  private:
-  size_t bytes_marked_;
-  std::stack<HeapObject*> marking_stack_;
-  ConcurrentMarkingMarkbits markbits_;
+  // Helper class for collecting in-object slot addresses and values.
+  class SlotSnapshottingVisitor final : public ObjectVisitor {
+   public:
+    explicit SlotSnapshottingVisitor(SlotSnapshot* slot_snapshot)
+        : slot_snapshot_(slot_snapshot) {
+      slot_snapshot_->clear();
+    }
+
+    void VisitPointers(HeapObject* host, Object** start,
+                       Object** end) override {
+      for (Object** p = start; p < end; p++) {
+        Object* object = reinterpret_cast<Object*>(
+            base::Relaxed_Load(reinterpret_cast<const base::AtomicWord*>(p)));
+        slot_snapshot_->add(p, object);
+      }
+    }
+
+   private:
+    SlotSnapshot* slot_snapshot_;
+  };
+
+  const SlotSnapshot& MakeSlotSnapshot(Map* map, HeapObject* object, int size) {
+    // TODO(ulan): Iterate only the existing fields and skip slack at the end
+    // of the object.
+    SlotSnapshottingVisitor visitor(&slot_snapshot_);
+    visitor.VisitPointer(object,
+                         reinterpret_cast<Object**>(object->map_slot()));
+    JSObject::BodyDescriptor::IterateBody(object, size, &visitor);
+    return slot_snapshot_;
+  }
+
+  MarkingState marking_state(HeapObject* object) const {
+    return MarkingState::Internal(object);
+  }
+
+  ConcurrentMarkingDeque* deque_;
+  SlotSnapshot slot_snapshot_;
 };
 
 class ConcurrentMarking::Task : public CancelableTask {
  public:
-  Task(Heap* heap, std::vector<HeapObject*>* root_set,
+  Task(Isolate* isolate, ConcurrentMarking* concurrent_marking,
        base::Semaphore* on_finish)
-      : CancelableTask(heap->isolate()),
-        heap_(heap),
-        on_finish_(on_finish),
-        root_set_(root_set) {}
+      : CancelableTask(isolate),
+        concurrent_marking_(concurrent_marking),
+        on_finish_(on_finish) {}
 
   virtual ~Task() {}
 
  private:
   // v8::internal::CancelableTask overrides.
   void RunInternal() override {
-    double time_ms = heap_->MonotonicallyIncreasingTimeInMs();
-    {
-      TimedScope scope(&time_ms);
-      for (HeapObject* obj : *root_set_) {
-        marking_visitor_.MarkObject(obj);
-      }
-      marking_visitor_.MarkTransitively();
-    }
-    if (FLAG_trace_concurrent_marking) {
-      heap_->isolate()->PrintWithTimestamp(
-          "concurrently marked %dKB in %.2fms\n",
-          static_cast<int>(marking_visitor_.bytes_marked() / KB), time_ms);
-    }
+    concurrent_marking_->Run();
     on_finish_->Signal();
   }
 
-  Heap* heap_;
+  ConcurrentMarking* concurrent_marking_;
   base::Semaphore* on_finish_;
-  ConcurrentMarkingVisitor marking_visitor_;
-  std::vector<HeapObject*>* root_set_;
   DISALLOW_COPY_AND_ASSIGN(Task);
 };
 
-ConcurrentMarking::ConcurrentMarking(Heap* heap)
-    : heap_(heap), pending_task_semaphore_(0), is_task_pending_(false) {
-  // Concurrent marking does not work with double unboxing.
-  STATIC_ASSERT(!(V8_CONCURRENT_MARKING && V8_DOUBLE_FIELDS_UNBOXING));
+ConcurrentMarking::ConcurrentMarking(Heap* heap, ConcurrentMarkingDeque* deque)
+    : heap_(heap),
+      pending_task_semaphore_(0),
+      deque_(deque),
+      visitor_(new ConcurrentMarkingVisitor(deque_)),
+      is_task_pending_(false) {
   // The runtime flag should be set only if the compile time flag was set.
-  CHECK(!FLAG_concurrent_marking || V8_CONCURRENT_MARKING);
+#ifndef V8_CONCURRENT_MARKING
+  CHECK(!FLAG_concurrent_marking);
+#endif
 }
 
-ConcurrentMarking::~ConcurrentMarking() {}
+ConcurrentMarking::~ConcurrentMarking() { delete visitor_; }
 
-void ConcurrentMarking::AddRoot(HeapObject* object) {
-  root_set_.push_back(object);
+void ConcurrentMarking::Run() {
+  double time_ms = heap_->MonotonicallyIncreasingTimeInMs();
+  size_t bytes_marked = 0;
+  base::Mutex* relocation_mutex = heap_->relocation_mutex();
+  {
+    TimedScope scope(&time_ms);
+    while (true) {
+      base::LockGuard<base::Mutex> guard(relocation_mutex);
+      HeapObject* object = deque_->Pop(MarkingThread::kConcurrent);
+      if (object == nullptr) break;
+      Address new_space_top = heap_->new_space()->original_top();
+      Address new_space_limit = heap_->new_space()->original_limit();
+      Address addr = object->address();
+      if (new_space_top <= addr && addr < new_space_limit) {
+        deque_->Push(object, MarkingThread::kConcurrent, TargetDeque::kBailout);
+      } else {
+        Map* map = object->synchronized_map();
+        bytes_marked += visitor_->Visit(map, object);
+      }
+    }
+  }
+  if (FLAG_trace_concurrent_marking) {
+    heap_->isolate()->PrintWithTimestamp("concurrently marked %dKB in %.2fms\n",
+                                         static_cast<int>(bytes_marked / KB),
+                                         time_ms);
+  }
 }
 
 void ConcurrentMarking::StartTask() {
   if (!FLAG_concurrent_marking) return;
   is_task_pending_ = true;
-
   V8::GetCurrentPlatform()->CallOnBackgroundThread(
-      new Task(heap_, &root_set_, &pending_task_semaphore_),
+      new Task(heap_->isolate(), this, &pending_task_semaphore_),
       v8::Platform::kShortRunningTask);
 }
 
@@ -148,7 +325,6 @@ void ConcurrentMarking::WaitForTaskToComplete() {
   if (!FLAG_concurrent_marking) return;
   pending_task_semaphore_.Wait();
   is_task_pending_ = false;
-  root_set_.clear();
 }
 
 void ConcurrentMarking::EnsureTaskCompleted() {

@@ -292,7 +292,7 @@ void MacroAssembler::RecordWriteField(
   leap(dst, FieldOperand(object, offset));
   if (emit_debug_code()) {
     Label ok;
-    testb(dst, Immediate((1 << kPointerSizeLog2) - 1));
+    testb(dst, Immediate(kPointerSize - 1));
     j(zero, &ok, Label::kNear);
     int3();
     bind(&ok);
@@ -597,10 +597,9 @@ void MacroAssembler::Abort(BailoutReason reason) {
   int3();
 }
 
-
-void MacroAssembler::CallStub(CodeStub* stub, TypeFeedbackId ast_id) {
+void MacroAssembler::CallStub(CodeStub* stub) {
   DCHECK(AllowThisStubCall(stub));  // Calls are not allowed in some stubs
-  Call(stub->GetCode(), RelocInfo::CODE_TARGET, ast_id);
+  Call(stub->GetCode(), RelocInfo::CODE_TARGET);
 }
 
 
@@ -2501,6 +2500,14 @@ void MacroAssembler::Move(Register dst, Register src) {
   }
 }
 
+void MacroAssembler::MoveNumber(Register dst, double value) {
+  int32_t smi;
+  if (DoubleToSmiInteger(value, &smi)) {
+    Move(dst, Smi::FromInt(smi));
+  } else {
+    movp_heap_number(dst, value);
+  }
+}
 
 void MacroAssembler::Move(Register dst, Handle<Object> source) {
   AllowDeferredHandleDereference smi_check;
@@ -3046,21 +3053,6 @@ void MacroAssembler::PopQuad(const Operand& dst) {
 }
 
 
-void MacroAssembler::LoadSharedFunctionInfoSpecialField(Register dst,
-                                                        Register base,
-                                                        int offset) {
-  DCHECK(offset > SharedFunctionInfo::kLengthOffset &&
-         offset <= SharedFunctionInfo::kSize &&
-         (((offset - SharedFunctionInfo::kLengthOffset) / kIntSize) % 2 == 1));
-  if (kPointerSize == kInt64Size) {
-    movsxlq(dst, FieldOperand(base, offset));
-  } else {
-    movp(dst, FieldOperand(base, offset));
-    SmiToInteger32(dst, dst);
-  }
-}
-
-
 void MacroAssembler::Jump(ExternalReference ext) {
   LoadAddress(kScratchRegister, ext);
   jmp(kScratchRegister);
@@ -3129,16 +3121,13 @@ void MacroAssembler::Call(Address destination, RelocInfo::Mode rmode) {
 #endif
 }
 
-
-void MacroAssembler::Call(Handle<Code> code_object,
-                          RelocInfo::Mode rmode,
-                          TypeFeedbackId ast_id) {
+void MacroAssembler::Call(Handle<Code> code_object, RelocInfo::Mode rmode) {
 #ifdef DEBUG
   int end_position = pc_offset() + CallSize(code_object);
 #endif
   DCHECK(RelocInfo::IsCodeTarget(rmode) ||
       rmode == RelocInfo::CODE_AGE_SEQUENCE);
-  call(code_object, rmode, ast_id);
+  call(code_object, rmode);
 #ifdef DEBUG
   CHECK_EQ(end_position, pc_offset());
 #endif
@@ -3446,7 +3435,8 @@ void MacroAssembler::PushStackHandler() {
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0);
 
   // Link the current handler as the next handler.
-  ExternalReference handler_address(Isolate::kHandlerAddress, isolate());
+  ExternalReference handler_address(IsolateAddressId::kHandlerAddress,
+                                    isolate());
   Push(ExternalOperand(handler_address));
 
   // Set this new handler as the current one.
@@ -3456,7 +3446,8 @@ void MacroAssembler::PushStackHandler() {
 
 void MacroAssembler::PopStackHandler() {
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0);
-  ExternalReference handler_address(Isolate::kHandlerAddress, isolate());
+  ExternalReference handler_address(IsolateAddressId::kHandlerAddress,
+                                    isolate());
   Pop(ExternalOperand(handler_address));
   addp(rsp, Immediate(StackHandlerConstants::kSize - kPointerSize));
 }
@@ -3693,6 +3684,16 @@ void MacroAssembler::AssertSmi(const Operand& object) {
   }
 }
 
+void MacroAssembler::AssertFixedArray(Register object) {
+  if (emit_debug_code()) {
+    testb(object, Immediate(kSmiTagMask));
+    Check(not_equal, kOperandIsASmiAndNotAFixedArray);
+    Push(object);
+    CmpObjectType(object, FIXED_ARRAY_TYPE, object);
+    Pop(object);
+    Check(equal, kOperandIsNotAFixedArray);
+  }
+}
 
 void MacroAssembler::AssertZeroExtended(Register int32_register) {
   if (emit_debug_code()) {
@@ -3913,8 +3914,8 @@ void MacroAssembler::InvokeFunction(Register function,
                                     InvokeFlag flag,
                                     const CallWrapper& call_wrapper) {
   movp(rbx, FieldOperand(function, JSFunction::kSharedFunctionInfoOffset));
-  LoadSharedFunctionInfoSpecialField(
-      rbx, rbx, SharedFunctionInfo::kFormalParameterCountOffset);
+  movsxlq(rbx,
+          FieldOperand(rbx, SharedFunctionInfo::kFormalParameterCountOffset));
 
   ParameterCount expected(rbx);
   InvokeFunction(function, new_target, expected, actual, flag, call_wrapper);
@@ -4204,9 +4205,9 @@ void MacroAssembler::EnterExitFramePrologue(bool save_rax,
     movp(r14, rax);  // Backup rax in callee-save register.
   }
 
-  Store(ExternalReference(Isolate::kCEntryFPAddress, isolate()), rbp);
-  Store(ExternalReference(Isolate::kContextAddress, isolate()), rsi);
-  Store(ExternalReference(Isolate::kCFunctionAddress, isolate()), rbx);
+  Store(ExternalReference(IsolateAddressId::kCEntryFPAddress, isolate()), rbp);
+  Store(ExternalReference(IsolateAddressId::kContextAddress, isolate()), rsi);
+  Store(ExternalReference(IsolateAddressId::kCFunctionAddress, isolate()), rbx);
 }
 
 
@@ -4305,7 +4306,8 @@ void MacroAssembler::LeaveApiExitFrame(bool restore_context) {
 
 void MacroAssembler::LeaveExitFrameEpilogue(bool restore_context) {
   // Restore current context from top and clear it in debug mode.
-  ExternalReference context_address(Isolate::kContextAddress, isolate());
+  ExternalReference context_address(IsolateAddressId::kContextAddress,
+                                    isolate());
   Operand context_operand = ExternalOperand(context_address);
   if (restore_context) {
     movp(rsi, context_operand);
@@ -4315,7 +4317,7 @@ void MacroAssembler::LeaveExitFrameEpilogue(bool restore_context) {
 #endif
 
   // Clear the top frame.
-  ExternalReference c_entry_fp_address(Isolate::kCEntryFPAddress,
+  ExternalReference c_entry_fp_address(IsolateAddressId::kCEntryFPAddress,
                                        isolate());
   Operand c_entry_fp_operand = ExternalOperand(c_entry_fp_address);
   movp(c_entry_fp_operand, Immediate(0));
@@ -4786,6 +4788,7 @@ void MacroAssembler::CallCFunction(ExternalReference function,
 
 
 void MacroAssembler::CallCFunction(Register function, int num_arguments) {
+  DCHECK_LE(num_arguments, kMaxCParameters);
   DCHECK(has_frame());
   // Check stack alignment.
   if (emit_debug_code()) {

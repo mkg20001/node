@@ -11,14 +11,6 @@
 
 var GlobalObject = global.Object;
 var iteratorSymbol = utils.ImportNow("iterator_symbol");
-var ObjectToString = utils.ImportNow("object_to_string");
-
-// ----------------------------------------------------------------------------
-
-
-// Set up global object.
-var attributes = DONT_ENUM | DONT_DELETE | READ_ONLY;
-
 
 // ----------------------------------------------------------------------------
 // Object
@@ -28,15 +20,6 @@ function ObjectToLocaleString() {
   CHECK_OBJECT_COERCIBLE(this, "Object.prototype.toLocaleString");
   return this.toString();
 }
-
-
-// ES6 19.1.3.3 Object.prototype.isPrototypeOf(V)
-function ObjectIsPrototypeOf(V) {
-  if (!IS_RECEIVER(V)) return false;
-  var O = TO_OBJECT(this);
-  return %HasInPrototypeChain(V, O);
-}
-
 
 // ES6 7.3.9
 function GetMethod(obj, p) {
@@ -67,10 +50,10 @@ function ObjectConstructor(x) {
 
 // Set up non-enumerable functions on the Object.prototype object.
 utils.InstallFunctions(GlobalObject.prototype, DONT_ENUM, [
-  "toString", ObjectToString,
+  // toString is added in bootstrapper.cc
   "toLocaleString", ObjectToLocaleString,
   // valueOf is added in bootstrapper.cc.
-  "isPrototypeOf", ObjectIsPrototypeOf,
+  // isPrototypeOf is added in bootstrapper.cc.
   // propertyIsEnumerable is added in bootstrapper.cc.
   // __defineGetter__ is added in bootstrapper.cc.
   // __lookupGetter__ is added in bootstrapper.cc.
@@ -103,7 +86,6 @@ function GetIterator(obj, method) {
 utils.Export(function(to) {
   to.GetIterator = GetIterator;
   to.GetMethod = GetMethod;
-  to.ObjectHasOwnProperty = GlobalObject.prototype.hasOwnProperty;
 });
 
 })

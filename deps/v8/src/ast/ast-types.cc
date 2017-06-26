@@ -84,7 +84,6 @@ double AstType::Min() {
   if (this->IsRange()) return this->AsRange()->Min();
   if (this->IsConstant()) return this->AsConstant()->Value()->Number();
   UNREACHABLE();
-  return 0;
 }
 
 double AstType::Max() {
@@ -100,7 +99,6 @@ double AstType::Max() {
   if (this->IsRange()) return this->AsRange()->Max();
   if (this->IsConstant()) return this->AsConstant()->Value()->Number();
   UNREACHABLE();
-  return 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -147,7 +145,6 @@ AstType::bitset AstBitsetType::Lub(AstType* type) {
   if (type->IsFunction()) return kFunction;
   if (type->IsTuple()) return kOtherInternal;
   UNREACHABLE();
-  return kNone;
 }
 
 AstType::bitset AstBitsetType::Lub(i::Map* map) {
@@ -302,29 +299,29 @@ AstType::bitset AstBitsetType::Lub(i::Map* map) {
     case FILLER_TYPE:
     case ACCESS_CHECK_INFO_TYPE:
     case INTERCEPTOR_INFO_TYPE:
-    case CALL_HANDLER_INFO_TYPE:
     case PROMISE_RESOLVE_THENABLE_JOB_INFO_TYPE:
     case PROMISE_REACTION_JOB_INFO_TYPE:
     case FUNCTION_TEMPLATE_INFO_TYPE:
     case OBJECT_TEMPLATE_INFO_TYPE:
     case ALLOCATION_MEMENTO_TYPE:
-    case TYPE_FEEDBACK_INFO_TYPE:
     case ALIASED_ARGUMENTS_ENTRY_TYPE:
     case DEBUG_INFO_TYPE:
-    case BREAK_POINT_INFO_TYPE:
     case STACK_FRAME_INFO_TYPE:
     case CELL_TYPE:
     case WEAK_CELL_TYPE:
     case PROTOTYPE_INFO_TYPE:
+    case SMALL_ORDERED_HASH_MAP_TYPE:
+    case SMALL_ORDERED_HASH_SET_TYPE:
     case TUPLE2_TYPE:
     case TUPLE3_TYPE:
     case CONTEXT_EXTENSION_TYPE:
-    case CONSTANT_ELEMENTS_PAIR_TYPE:
+    case PADDING_TYPE_1:
+    case PADDING_TYPE_2:
+    case PADDING_TYPE_3:
+    case PADDING_TYPE_4:
       UNREACHABLE();
-      return kNone;
   }
   UNREACHABLE();
-  return kNone;
 }
 
 AstType::bitset AstBitsetType::Lub(i::Object* value) {
@@ -493,7 +490,6 @@ bool AstType::SimplyEquals(AstType* that) {
     return true;
   }
   UNREACHABLE();
-  return false;
 }
 
 AstType::bitset AstType::Representation() {

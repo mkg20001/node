@@ -4,6 +4,7 @@
 
 #include "src/contexts.h"
 
+#include "src/ast/modules.h"
 #include "src/bootstrapper.h"
 #include "src/debug/debug.h"
 #include "src/isolate-inl.h"
@@ -199,7 +200,6 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
                                int* index, PropertyAttributes* attributes,
                                InitializationFlag* init_flag,
                                VariableMode* variable_mode) {
-  DCHECK(!IsModuleContext());
   Isolate* isolate = GetIsolate();
   Handle<Context> context(this, isolate);
 
@@ -305,7 +305,8 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
 
     // 2. Check the context proper if it has slots.
     if (context->IsFunctionContext() || context->IsBlockContext() ||
-        context->IsScriptContext() || context->IsEvalContext()) {
+        context->IsScriptContext() || context->IsEvalContext() ||
+        context->IsModuleContext()) {
       // Use serialized scope information of functions and blocks to search
       // for the context index.
       Handle<ScopeInfo> scope_info(context->scope_info());
@@ -346,6 +347,27 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
         }
       }
 
+      // Lookup variable in module imports and exports.
+      if (context->IsModuleContext()) {
+        VariableMode mode;
+        InitializationFlag flag;
+        MaybeAssignedFlag maybe_assigned_flag;
+        int cell_index =
+            scope_info->ModuleIndex(name, &mode, &flag, &maybe_assigned_flag);
+        if (cell_index != 0) {
+          if (FLAG_trace_contexts) {
+            PrintF("=> found in module imports or exports\n");
+          }
+          *index = cell_index;
+          *variable_mode = mode;
+          *init_flag = flag;
+          *attributes = ModuleDescriptor::GetCellIndexKind(cell_index) ==
+                                ModuleDescriptor::kExport
+                            ? GetAttributesForMode(mode)
+                            : READ_ONLY;
+          return handle(context->module(), isolate);
+        }
+      }
     } else if (context->IsCatchContext()) {
       // Catch contexts have the variable name in the extension slot.
       if (String::Equals(name, handle(context->catch_name()))) {
@@ -398,9 +420,11 @@ Handle<Object> Context::Lookup(Handle<String> name, ContextLookupFlags flags,
       do {
         context = Handle<Context>(context->previous(), isolate);
         // If we come across a whitelist context, and the name is not
-        // whitelisted, then only consider with, script or native contexts.
+        // whitelisted, then only consider with, script, module or native
+        // contexts.
       } while (failed_whitelist && !context->IsScriptContext() &&
-               !context->IsNativeContext() && !context->IsWithContext());
+               !context->IsNativeContext() && !context->IsWithContext() &&
+               !context->IsModuleContext());
     }
   } while (follow_context_chain);
 
@@ -416,18 +440,19 @@ static const int kOsrAstIdOffset = 2;
 static const int kEntryLength = 3;
 static const int kInitialLength = kEntryLength;
 
-int Context::SearchOptimizedCodeMapEntry(SharedFunctionInfo* shared,
-                                         BailoutId osr_ast_id) {
+int Context::SearchOSROptimizedCodeCacheEntry(SharedFunctionInfo* shared,
+                                              BailoutId osr_ast_id) {
   DisallowHeapAllocation no_gc;
   DCHECK(this->IsNativeContext());
-  if (!OptimizedCodeMapIsCleared()) {
-    FixedArray* optimized_code_map = this->osr_code_table();
-    int length = optimized_code_map->length();
+  DCHECK(!osr_ast_id.IsNone());
+  if (!OSROptimizedCodeCacheIsCleared()) {
+    FixedArray* osr_code_table = this->osr_code_table();
+    int length = osr_code_table->length();
     Smi* osr_ast_id_smi = Smi::FromInt(osr_ast_id.ToInt());
     for (int i = 0; i < length; i += kEntryLength) {
-      if (WeakCell::cast(optimized_code_map->get(i + kSharedOffset))->value() ==
+      if (WeakCell::cast(osr_code_table->get(i + kSharedOffset))->value() ==
               shared &&
-          optimized_code_map->get(i + kOsrAstIdOffset) == osr_ast_id_smi) {
+          osr_code_table->get(i + kOsrAstIdOffset) == osr_ast_id_smi) {
         return i;
       }
     }
@@ -435,10 +460,10 @@ int Context::SearchOptimizedCodeMapEntry(SharedFunctionInfo* shared,
   return -1;
 }
 
-Code* Context::SearchOptimizedCodeMap(SharedFunctionInfo* shared,
-                                      BailoutId osr_ast_id) {
+Code* Context::SearchOSROptimizedCodeCache(SharedFunctionInfo* shared,
+                                           BailoutId osr_ast_id) {
   DCHECK(this->IsNativeContext());
-  int entry = SearchOptimizedCodeMapEntry(shared, osr_ast_id);
+  int entry = SearchOSROptimizedCodeCacheEntry(shared, osr_ast_id);
   if (entry != -1) {
     FixedArray* code_map = osr_code_table();
     DCHECK_LE(entry + kEntryLength, code_map->length());
@@ -448,11 +473,13 @@ Code* Context::SearchOptimizedCodeMap(SharedFunctionInfo* shared,
   return nullptr;
 }
 
-void Context::AddToOptimizedCodeMap(Handle<Context> native_context,
-                                    Handle<SharedFunctionInfo> shared,
-                                    Handle<Code> code,
-                                    BailoutId osr_ast_id) {
+void Context::AddToOSROptimizedCodeCache(Handle<Context> native_context,
+                                         Handle<SharedFunctionInfo> shared,
+                                         Handle<Code> code,
+                                         BailoutId osr_ast_id) {
   DCHECK(native_context->IsNativeContext());
+  DCHECK(!osr_ast_id.IsNone());
+  DCHECK(code->kind() == Code::OPTIMIZED_FUNCTION);
   Isolate* isolate = native_context->GetIsolate();
   if (isolate->serializer_enabled()) return;
 
@@ -460,12 +487,13 @@ void Context::AddToOptimizedCodeMap(Handle<Context> native_context,
   Handle<FixedArray> new_code_map;
   int entry;
 
-  if (native_context->OptimizedCodeMapIsCleared()) {
+  if (native_context->OSROptimizedCodeCacheIsCleared()) {
     new_code_map = isolate->factory()->NewFixedArray(kInitialLength, TENURED);
     entry = 0;
   } else {
     Handle<FixedArray> old_code_map(native_context->osr_code_table(), isolate);
-    entry = native_context->SearchOptimizedCodeMapEntry(*shared, osr_ast_id);
+    entry =
+        native_context->SearchOSROptimizedCodeCacheEntry(*shared, osr_ast_id);
     if (entry >= 0) {
       // Just set the code of the entry.
       Handle<WeakCell> code_cell = isolate->factory()->NewWeakCell(code);
@@ -517,11 +545,11 @@ void Context::AddToOptimizedCodeMap(Handle<Context> native_context,
   }
 }
 
-void Context::EvictFromOptimizedCodeMap(Code* optimized_code,
-                                        const char* reason) {
+void Context::EvictFromOSROptimizedCodeCache(Code* optimized_code,
+                                             const char* reason) {
   DCHECK(IsNativeContext());
   DisallowHeapAllocation no_gc;
-  if (OptimizedCodeMapIsCleared()) return;
+  if (OSROptimizedCodeCacheIsCleared()) return;
 
   Heap* heap = GetHeap();
   FixedArray* code_map = osr_code_table();
@@ -556,12 +584,12 @@ void Context::EvictFromOptimizedCodeMap(Code* optimized_code,
     // Always trim even when array is cleared because of heap verifier.
     heap->RightTrimFixedArray(code_map, length - dst);
     if (code_map->length() == 0) {
-      ClearOptimizedCodeMap();
+      ClearOSROptimizedCodeCache();
     }
   }
 }
 
-void Context::ClearOptimizedCodeMap() {
+void Context::ClearOSROptimizedCodeCache() {
   DCHECK(IsNativeContext());
   FixedArray* empty_fixed_array = GetHeap()->empty_fixed_array();
   set_osr_code_table(empty_fixed_array);
@@ -569,8 +597,8 @@ void Context::ClearOptimizedCodeMap() {
 
 void Context::AddOptimizedFunction(JSFunction* function) {
   DCHECK(IsNativeContext());
-  Isolate* isolate = GetIsolate();
 #ifdef ENABLE_SLOW_DCHECKS
+  Isolate* isolate = GetIsolate();
   if (FLAG_enable_slow_asserts) {
     Object* element = get(OPTIMIZED_FUNCTIONS_LIST);
     while (!element->IsUndefined(isolate)) {
@@ -592,15 +620,7 @@ void Context::AddOptimizedFunction(JSFunction* function) {
   CHECK(found);
 #endif
 
-  // If the function link field is already used then the function was
-  // enqueued as a code flushing candidate and we remove it now.
-  if (!function->next_function_link()->IsUndefined(isolate)) {
-    CodeFlusher* flusher = GetHeap()->mark_compact_collector()->code_flusher();
-    flusher->EvictCandidate(function);
-  }
-
-  DCHECK(function->next_function_link()->IsUndefined(isolate));
-
+  DCHECK(function->next_function_link()->IsUndefined(GetIsolate()));
   function->set_next_function_link(get(OPTIMIZED_FUNCTIONS_LIST),
                                    UPDATE_WEAK_WRITE_BARRIER);
   set(OPTIMIZED_FUNCTIONS_LIST, function, UPDATE_WEAK_WRITE_BARRIER);

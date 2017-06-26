@@ -43,6 +43,7 @@
     'v8_enable_i18n_support%': 1,
     'v8_deprecation_warnings': 1,
     'v8_imminent_deprecation_warnings': 1,
+    'v8_check_microtasks_scopes_consistency': 'true',
     'msvs_multi_core_compile%': '1',
     'mac_deployment_target%': '10.7',
     'release_extra_cflags%': '',
@@ -696,12 +697,15 @@
           ['sysroot!="" and clang==1', {
             'target_conditions': [
               ['_toolset=="target"', {
+                'variables': {
+                  'ld_paths': ['<!(<(DEPTH)/build/linux/sysroot_ld_path.sh <(sysroot))'],
+                },
                 'cflags': [
                   '--sysroot=<(sysroot)',
                 ],
                 'ldflags': [
                   '--sysroot=<(sysroot)',
-                  '<!(<(DEPTH)/build/linux/sysroot_ld_path.sh <(sysroot))',
+                  '<!(<(base_dir)/gypfiles/sysroot_ld_flags.sh <@(ld_paths))',
                 ],
               }]]
           }],
@@ -780,6 +784,12 @@
               # Don't warn about unrecognized command line option.
               '-Wno-gnu-zero-variadic-macro-arguments',
             ],
+            'cflags' : [
+              # Disable gcc warnings for optimizations based on the assumption
+              # that signed overflow does not occur. Generates false positives
+              # (see http://crbug.com/v8/6341).
+              "-Wno-strict-overflow",
+            ],
           }],
           [ 'clang==1 and (v8_target_arch=="x64" or v8_target_arch=="arm64" \
             or v8_target_arch=="mips64el")', {
@@ -855,7 +865,6 @@
           }],
         ],
         'msvs_cygwin_shell': 0,
-        'msvs_cygwin_dirs': ['<(DEPTH)/third_party/cygwin'],
         'msvs_disabled_warnings': [
           # C4091: 'typedef ': ignored on left of 'X' when no variable is
           #                    declared.
@@ -1493,11 +1502,13 @@
               '-fsanitize=cfi-derived-cast',
               '-fsanitize=cfi-unrelated-cast',
               '-fsanitize-blacklist=<(cfi_blacklist)',
+              '-fwhole-program-vtables',
             ],
             'ldflags': [
               '-fsanitize=cfi-vcall',
               '-fsanitize=cfi-derived-cast',
               '-fsanitize=cfi-unrelated-cast',
+              '-fwhole-program-vtables',
             ],
           }],
         ],

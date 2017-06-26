@@ -18,7 +18,8 @@ class Handle;
 class Isolate;
 
 // Forward declarations.
-class ObjectVisitor;
+class BailoutId;
+class RootVisitor;
 enum class InterpreterPushArgsMode : unsigned;
 namespace compiler {
 class CodeAssemblerState;
@@ -31,7 +32,7 @@ class Builtins {
   void TearDown();
 
   // Garbage collection support.
-  void IterateBuiltins(ObjectVisitor* v);
+  void IterateBuiltins(RootVisitor* v);
 
   // Disassembler support.
   const char* Lookup(byte* pc);
@@ -42,6 +43,9 @@ class Builtins {
 #undef DEF_ENUM
         builtin_count
   };
+
+  static BailoutId GetContinuationBailoutId(Name name);
+  static Name GetBuiltinFromBailoutId(BailoutId);
 
 #define DECLARE_BUILTIN_ACCESSOR(Name, ...) \
   V8_EXPORT_PRIVATE Handle<Code> Name();
@@ -64,7 +68,7 @@ class Builtins {
   Handle<Code> InterpreterPushArgsThenConstruct(InterpreterPushArgsMode mode);
   Handle<Code> NewFunctionContext(ScopeType scope_type);
   Handle<Code> NewCloneShallowArray(AllocationSiteMode allocation_mode);
-  Handle<Code> NewCloneShallowObject(int length);
+  Handle<Code> JSConstructStubGeneric();
 
   Code* builtin(Name name) {
     // Code::cast cannot be used here since we access builtins
@@ -76,7 +80,13 @@ class Builtins {
     return reinterpret_cast<Address>(&builtins_[name]);
   }
 
-  static Callable CallableFor(Isolate* isolate, Name name);
+  Handle<Code> builtin_handle(Name name);
+
+  static int GetBuiltinParameterCount(Name name);
+
+  V8_EXPORT_PRIVATE static Callable CallableFor(Isolate* isolate, Name name);
+
+  static int GetStackParameterCount(Isolate* isolate, Name name);
 
   static const char* name(int index);
 
@@ -89,6 +99,12 @@ class Builtins {
   static bool HasCppImplementation(int index);
 
   bool is_initialized() const { return initialized_; }
+
+  // Used by SetupIsolateDelegate and Deserializer.
+  void MarkInitialized() {
+    DCHECK(!initialized_);
+    initialized_ = true;
+  }
 
   MUST_USE_RESULT static MaybeHandle<Object> InvokeApiFunction(
       Isolate* isolate, bool is_construct, Handle<HeapObject> function,
@@ -105,11 +121,6 @@ class Builtins {
 
  private:
   Builtins();
-  // Used by SetupIsolateDelegate.
-  void MarkInitialized() {
-    DCHECK(!initialized_);
-    initialized_ = true;
-  }
 
   static void Generate_CallFunction(MacroAssembler* masm,
                                     ConvertReceiverMode mode,
@@ -120,8 +131,11 @@ class Builtins {
 
   static void Generate_Call(MacroAssembler* masm, ConvertReceiverMode mode,
                             TailCallMode tail_call_mode);
-  static void Generate_CallForwardVarargs(MacroAssembler* masm,
-                                          Handle<Code> code);
+
+  static void Generate_CallOrConstructVarargs(MacroAssembler* masm,
+                                              Handle<Code> code);
+  static void Generate_CallOrConstructForwardVarargs(MacroAssembler* masm,
+                                                     Handle<Code> code);
 
   static void Generate_InterpreterPushArgsThenCallImpl(
       MacroAssembler* masm, ConvertReceiverMode receiver_mode,

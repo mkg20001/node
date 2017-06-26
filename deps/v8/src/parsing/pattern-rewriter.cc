@@ -26,6 +26,7 @@ void Parser::PatternRewriter::DeclareAndInitializeVariables(
   rewriter.context_ = BINDING;
   rewriter.pattern_ = declaration->pattern;
   rewriter.initializer_position_ = declaration->initializer_position;
+  rewriter.value_beg_position_ = declaration->value_beg_position;
   rewriter.block_ = block;
   rewriter.descriptor_ = declaration_descriptor;
   rewriter.names_ = names;
@@ -236,7 +237,10 @@ void Parser::PatternRewriter::VisitVariableProxy(VariableProxy* pattern) {
       DCHECK_NOT_NULL(proxy->var());
     }
     // Add break location for destructured sub-pattern.
-    int pos = IsSubPattern() ? pattern->position() : value->position();
+    int pos = value_beg_position_;
+    if (pos == kNoSourcePosition) {
+      pos = IsSubPattern() ? pattern->position() : value->position();
+    }
     Assignment* assignment =
         factory()->NewAssignment(Token::INIT, proxy, value, pos);
     block_->statements()->Add(
@@ -364,7 +368,8 @@ void Parser::PatternRewriter::VisitObjectLiteral(ObjectLiteral* pattern,
     rest_runtime_callargs->Add(factory()->NewVariableProxy(temp), zone());
   }
 
-  block_->statements()->Add(parser_->BuildAssertIsCoercible(temp), zone());
+  block_->statements()->Add(parser_->BuildAssertIsCoercible(temp, pattern),
+                            zone());
 
   for (ObjectLiteralProperty* property : *pattern->properties()) {
     PatternContext context = SetInitializerContextIfNeeded(property->value());
@@ -430,9 +435,9 @@ void Parser::PatternRewriter::VisitArrayLiteral(ArrayLiteral* node,
   DCHECK(block_->ignore_completion_value());
 
   auto temp = *temp_var = CreateTempVar(current_value_);
-  auto iterator = CreateTempVar(
-      factory()->NewGetIterator(factory()->NewVariableProxy(temp),
-                                IteratorType::kNormal, kNoSourcePosition));
+  auto iterator = CreateTempVar(factory()->NewGetIterator(
+      factory()->NewVariableProxy(temp), IteratorType::kNormal,
+      current_value_->position()));
   auto done =
       CreateTempVar(factory()->NewBooleanLiteral(false, kNoSourcePosition));
   auto result = CreateTempVar();
@@ -763,6 +768,7 @@ NOT_A_PATTERN(VariableDeclaration)
 NOT_A_PATTERN(WhileStatement)
 NOT_A_PATTERN(WithStatement)
 NOT_A_PATTERN(Suspend)
+NOT_A_PATTERN(YieldStar)
 
 #undef NOT_A_PATTERN
 }  // namespace internal

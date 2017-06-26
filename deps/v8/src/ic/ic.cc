@@ -50,7 +50,6 @@ char IC::TransitionMarkFromState(IC::State state) {
       return 'G';
   }
   UNREACHABLE();
-  return 0;
 }
 
 
@@ -230,12 +229,8 @@ IC::IC(FrameDepth depth, Isolate* isolate, FeedbackNexus* nexus)
   } else {
     Code* target = this->target();
     Code::Kind kind = target->kind();
-    if (kind == Code::BINARY_OP_IC) {
-      kind_ = FeedbackSlotKind::kBinaryOp;
-    } else if (kind == Code::COMPARE_IC) {
+    if (kind == Code::COMPARE_IC) {
       kind_ = FeedbackSlotKind::kCompareOp;
-    } else if (kind == Code::TO_BOOLEAN_IC) {
-      kind_ = FeedbackSlotKind::kToBoolean;
     } else {
       UNREACHABLE();
       kind_ = FeedbackSlotKind::kInvalid;
@@ -262,22 +257,13 @@ bool IC::ShouldPushPopSlotAndVector(Code::Kind kind) {
 InlineCacheState IC::StateFromCode(Code* code) {
   Isolate* isolate = code->GetIsolate();
   switch (code->kind()) {
-    case Code::BINARY_OP_IC: {
-      BinaryOpICState state(isolate, code->extra_ic_state());
-      return state.GetICState();
-    }
     case Code::COMPARE_IC: {
       CompareICStub stub(isolate, code->extra_ic_state());
-      return stub.GetICState();
-    }
-    case Code::TO_BOOLEAN_IC: {
-      ToBooleanICStub stub(isolate, code->extra_ic_state());
       return stub.GetICState();
     }
     default:
       if (code->is_debug_stub()) return UNINITIALIZED;
       UNREACHABLE();
-      return UNINITIALIZED;
   }
 }
 
@@ -428,23 +414,15 @@ static void ComputeTypeInfoCountDelta(IC::State old_state, IC::State new_state,
 
 // static
 void IC::OnFeedbackChanged(Isolate* isolate, JSFunction* host_function) {
-  Code* host = host_function->shared()->code();
-
-  if (host->kind() == Code::FUNCTION) {
-    TypeFeedbackInfo* info = TypeFeedbackInfo::cast(host->type_feedback_info());
-    info->change_own_type_change_checksum();
-    host->set_profiler_ticks(0);
-  } else if (host_function->IsInterpreted()) {
-    if (FLAG_trace_opt_verbose) {
-      if (host_function->shared()->profiler_ticks() != 0) {
-        PrintF("[resetting ticks for ");
-        host_function->PrintName();
-        PrintF(" due from %d due to IC change]\n",
-               host_function->shared()->profiler_ticks());
-      }
+  if (FLAG_trace_opt_verbose) {
+    if (host_function->shared()->profiler_ticks() != 0) {
+      PrintF("[resetting ticks for ");
+      host_function->PrintName();
+      PrintF(" due from %d due to IC change]\n",
+             host_function->shared()->profiler_ticks());
     }
-    host_function->shared()->set_profiler_ticks(0);
   }
+  host_function->shared()->set_profiler_ticks(0);
   isolate->runtime_profiler()->NotifyICChanged();
   // TODO(2029): When an optimized function is patched, it would
   // be nice to propagate the corresponding type information to its
@@ -454,9 +432,7 @@ void IC::OnFeedbackChanged(Isolate* isolate, JSFunction* host_function) {
 void IC::PostPatching(Address address, Code* target, Code* old_target) {
   // Type vector based ICs update these statistics at a different time because
   // they don't always patch on state change.
-  DCHECK(target->kind() == Code::BINARY_OP_IC ||
-         target->kind() == Code::COMPARE_IC ||
-         target->kind() == Code::TO_BOOLEAN_IC);
+  DCHECK(target->kind() == Code::COMPARE_IC);
 
   DCHECK(old_target->is_inline_cache_stub());
   DCHECK(target->is_inline_cache_stub());
@@ -480,10 +456,14 @@ void IC::PostPatching(Address address, Code* target, Code* old_target) {
       info->change_ic_with_type_info_count(polymorphic_delta);
       info->change_ic_generic_count(generic_delta);
     }
-    TypeFeedbackInfo* info = TypeFeedbackInfo::cast(host->type_feedback_info());
-    info->change_own_type_change_checksum();
   }
-  host->set_profiler_ticks(0);
+
+  // TODO(leszeks): Normally we would reset profiler ticks here -- but, we don't
+  // currently have access the the feedback vector from the IC. In practice,
+  // this is not an issue, as these ICs are only used by asm.js, which shouldn't
+  // have too many IC changes. This inconsistency should go away once these
+  // Crankshaft/hydrogen code stubs go away.
+
   isolate->runtime_profiler()->NotifyICChanged();
   // TODO(2029): When an optimized function is patched, it would
   // be nice to propagate the corresponding type information to its
@@ -549,7 +529,7 @@ void IC::ConfigureVectorState(Handle<Name> name, Handle<Map> map,
   OnFeedbackChanged(isolate(), GetHostFunction());
 }
 
-void IC::ConfigureVectorState(Handle<Name> name, MapHandleList* maps,
+void IC::ConfigureVectorState(Handle<Name> name, MapHandles const& maps,
                               List<Handle<Object>>* handlers) {
   DCHECK(!IsLoadGlobalIC());
   // Non-keyed ICs don't track the name explicitly.
@@ -636,16 +616,15 @@ MaybeHandle<Object> LoadGlobalIC::Load(Handle<Name> name) {
   return LoadIC::Load(global, name);
 }
 
-static bool AddOneReceiverMapIfMissing(MapHandleList* receiver_maps,
+static bool AddOneReceiverMapIfMissing(MapHandles* receiver_maps,
                                        Handle<Map> new_receiver_map) {
   DCHECK(!new_receiver_map.is_null());
-  for (int current = 0; current < receiver_maps->length(); ++current) {
-    if (!receiver_maps->at(current).is_null() &&
-        receiver_maps->at(current).is_identical_to(new_receiver_map)) {
+  for (Handle<Map> map : *receiver_maps) {
+    if (!map.is_null() && map.is_identical_to(new_receiver_map)) {
       return false;
     }
   }
-  receiver_maps->Add(new_receiver_map);
+  receiver_maps->push_back(new_receiver_map);
   return true;
 }
 
@@ -653,11 +632,11 @@ bool IC::UpdatePolymorphicIC(Handle<Name> name, Handle<Object> handler) {
   DCHECK(IsHandler(*handler));
   if (is_keyed() && state() != RECOMPUTE_HANDLER) return false;
   Handle<Map> map = receiver_map();
-  MapHandleList maps;
+  MapHandles maps;
   List<Handle<Object>> handlers;
 
   TargetMaps(&maps);
-  int number_of_maps = maps.length();
+  int number_of_maps = static_cast<int>(maps.size());
   int deprecated_maps = 0;
   int handler_to_overwrite = -1;
 
@@ -684,7 +663,9 @@ bool IC::UpdatePolymorphicIC(Handle<Name> name, Handle<Object> handler) {
   if (number_of_maps == 0 && state() != MONOMORPHIC && state() != POLYMORPHIC) {
     return false;
   }
-  if (!nexus()->FindHandlers(&handlers, maps.length())) return false;
+  if (!nexus()->FindHandlers(&handlers, static_cast<int>(maps.size()))) {
+    return false;
+  }
 
   number_of_valid_maps++;
   if (number_of_valid_maps > 1 && is_keyed()) return false;
@@ -694,14 +675,14 @@ bool IC::UpdatePolymorphicIC(Handle<Name> name, Handle<Object> handler) {
     if (handler_to_overwrite >= 0) {
       handlers.Set(handler_to_overwrite, handler);
       if (!map.is_identical_to(maps.at(handler_to_overwrite))) {
-        maps.Set(handler_to_overwrite, map);
+        maps[handler_to_overwrite] = map;
       }
     } else {
-      maps.Add(map);
+      maps.push_back(map);
       handlers.Add(handler);
     }
 
-    ConfigureVectorState(name, &maps, &handlers);
+    ConfigureVectorState(name, maps, &handlers);
   }
 
   return true;
@@ -714,11 +695,11 @@ void IC::UpdateMonomorphicIC(Handle<Object> handler, Handle<Name> name) {
 
 
 void IC::CopyICToMegamorphicCache(Handle<Name> name) {
-  MapHandleList maps;
+  MapHandles maps;
   List<Handle<Object>> handlers;
   TargetMaps(&maps);
-  if (!nexus()->FindHandlers(&handlers, maps.length())) return;
-  for (int i = 0; i < maps.length(); i++) {
+  if (!nexus()->FindHandlers(&handlers, static_cast<int>(maps.size()))) return;
+  for (int i = 0; i < static_cast<int>(maps.size()); i++) {
     UpdateMegamorphicCache(*maps.at(i), *name, *handlers.at(i));
   }
 }
@@ -732,9 +713,9 @@ bool IC::IsTransitionOfMonomorphicTarget(Map* source_map, Map* target_map) {
       source_map->elements_kind(), target_elements_kind);
   Map* transitioned_map = nullptr;
   if (more_general_transition) {
-    MapHandleList map_list;
-    map_list.Add(handle(target_map));
-    transitioned_map = source_map->FindElementsKindTransitionedMap(&map_list);
+    MapHandles map_list;
+    map_list.push_back(handle(target_map));
+    transitioned_map = source_map->FindElementsKindTransitionedMap(map_list);
   }
   return transitioned_map == target_map;
 }
@@ -1148,7 +1129,7 @@ Handle<Object> LoadIC::GetMapIndependentHandler(LookupIterator* lookup) {
         }
 
         // When debugging we need to go the slow path to flood the accessor.
-        if (GetHostFunction()->shared()->HasDebugInfo()) {
+        if (GetHostFunction()->shared()->HasBreakInfo()) {
           TRACE_HANDLER_STATS(isolate(), LoadIC_SlowStub);
           return slow_stub();
         }
@@ -1284,7 +1265,7 @@ Handle<Code> LoadIC::CompileHandler(LookupIterator* lookup) {
   Handle<Object> accessors = lookup->GetAccessors();
   DCHECK(accessors->IsAccessorPair());
   DCHECK(holder->HasFastProperties());
-  DCHECK(!GetHostFunction()->shared()->HasDebugInfo());
+  DCHECK(!GetHostFunction()->shared()->HasBreakInfo());
   Handle<Object> getter(Handle<AccessorPair>::cast(accessors)->getter(),
                         isolate());
   CallOptimization call_optimization(getter);
@@ -1323,16 +1304,15 @@ void KeyedLoadIC::UpdateLoadElement(Handle<HeapObject> receiver) {
   Handle<Map> receiver_map(receiver->map(), isolate());
   DCHECK(receiver_map->instance_type() != JS_VALUE_TYPE &&
          receiver_map->instance_type() != JS_PROXY_TYPE);  // Checked by caller.
-  MapHandleList target_receiver_maps;
+  MapHandles target_receiver_maps;
   TargetMaps(&target_receiver_maps);
 
-  if (target_receiver_maps.length() == 0) {
+  if (target_receiver_maps.empty()) {
     Handle<Object> handler = LoadElementHandler(receiver_map);
     return ConfigureVectorState(Handle<Name>(), receiver_map, handler);
   }
 
-  for (int i = 0; i < target_receiver_maps.length(); i++) {
-    Handle<Map> map = target_receiver_maps.at(i);
+  for (Handle<Map> map : target_receiver_maps) {
     if (map.is_null()) continue;
     if (map->instance_type() == JS_VALUE_TYPE) {
       TRACE_GENERIC_IC("JSValue");
@@ -1372,14 +1352,20 @@ void KeyedLoadIC::UpdateLoadElement(Handle<HeapObject> receiver) {
 
   // If the maximum number of receiver maps has been exceeded, use the generic
   // version of the IC.
-  if (target_receiver_maps.length() > kMaxKeyedPolymorphism) {
+  if (target_receiver_maps.size() > kMaxKeyedPolymorphism) {
     TRACE_GENERIC_IC("max polymorph exceeded");
     return;
   }
 
-  List<Handle<Object>> handlers(target_receiver_maps.length());
+  List<Handle<Object>> handlers(static_cast<int>(target_receiver_maps.size()));
   LoadElementPolymorphicHandlers(&target_receiver_maps, &handlers);
-  ConfigureVectorState(Handle<Name>(), &target_receiver_maps, &handlers);
+  DCHECK_LE(1, target_receiver_maps.size());
+  if (target_receiver_maps.size() == 1) {
+    ConfigureVectorState(Handle<Name>(), target_receiver_maps[0],
+                         handlers.at(0));
+  } else {
+    ConfigureVectorState(Handle<Name>(), target_receiver_maps, &handlers);
+  }
 }
 
 Handle<Object> KeyedLoadIC::LoadElementHandler(Handle<Map> receiver_map) {
@@ -1423,15 +1409,20 @@ Handle<Object> KeyedLoadIC::LoadElementHandler(Handle<Map> receiver_map) {
 }
 
 void KeyedLoadIC::LoadElementPolymorphicHandlers(
-    MapHandleList* receiver_maps, List<Handle<Object>>* handlers) {
-  for (int i = 0; i < receiver_maps->length(); ++i) {
-    Handle<Map> receiver_map(receiver_maps->at(i));
+    MapHandles* receiver_maps, List<Handle<Object>>* handlers) {
+  // Filter out deprecated maps to ensure their instances get migrated.
+  receiver_maps->erase(
+      std::remove_if(
+          receiver_maps->begin(), receiver_maps->end(),
+          [](const Handle<Map>& map) { return map->is_deprecated(); }),
+      receiver_maps->end());
 
+  for (Handle<Map> receiver_map : *receiver_maps) {
     // Mark all stable receiver maps that have elements kind transition map
     // among receiver_maps as unstable because the optimizing compilers may
     // generate an elements kind transition for this kind of receivers.
     if (receiver_map->is_stable()) {
-      Map* tmap = receiver_map->FindElementsKindTransitionedMap(receiver_maps);
+      Map* tmap = receiver_map->FindElementsKindTransitionedMap(*receiver_maps);
       if (tmap != nullptr) {
         receiver_map->NotifyLeafMapLayoutChange();
       }
@@ -1914,9 +1905,9 @@ Handle<Code> StoreIC::CompileHandler(LookupIterator* lookup) {
 
 void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
                                       KeyedAccessStoreMode store_mode) {
-  MapHandleList target_receiver_maps;
+  MapHandles target_receiver_maps;
   TargetMaps(&target_receiver_maps);
-  if (target_receiver_maps.length() == 0) {
+  if (target_receiver_maps.empty()) {
     Handle<Map> monomorphic_map =
         ComputeTransitionedMap(receiver_map, store_mode);
     store_mode = GetNonTransitioningStoreMode(store_mode);
@@ -1924,9 +1915,8 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
     return ConfigureVectorState(Handle<Name>(), monomorphic_map, handler);
   }
 
-  for (int i = 0; i < target_receiver_maps.length(); i++) {
-    if (!target_receiver_maps.at(i).is_null() &&
-        target_receiver_maps.at(i)->instance_type() == JS_VALUE_TYPE) {
+  for (Handle<Map> map : target_receiver_maps) {
+    if (!map.is_null() && map->instance_type() == JS_VALUE_TYPE) {
       TRACE_GENERIC_IC("JSValue");
       return;
     }
@@ -1991,7 +1981,7 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
 
   // If the maximum number of receiver maps has been exceeded, use the
   // megamorphic version of the IC.
-  if (target_receiver_maps.length() > kMaxKeyedPolymorphism) return;
+  if (target_receiver_maps.size() > kMaxKeyedPolymorphism) return;
 
   // Make sure all polymorphic handlers have the same store mode, otherwise the
   // megamorphic stub must be used.
@@ -2009,22 +1999,29 @@ void KeyedStoreIC::UpdateStoreElement(Handle<Map> receiver_map,
   // receivers are either external arrays, or all "normal" arrays. Otherwise,
   // use the megamorphic stub.
   if (store_mode != STANDARD_STORE) {
-    int external_arrays = 0;
-    for (int i = 0; i < target_receiver_maps.length(); ++i) {
-      if (target_receiver_maps[i]->has_fixed_typed_array_elements()) {
+    size_t external_arrays = 0;
+    for (Handle<Map> map : target_receiver_maps) {
+      if (map->has_fixed_typed_array_elements()) {
         external_arrays++;
       }
     }
     if (external_arrays != 0 &&
-        external_arrays != target_receiver_maps.length()) {
+        external_arrays != target_receiver_maps.size()) {
       TRACE_GENERIC_IC("unsupported combination of external and normal arrays");
       return;
     }
   }
 
-  List<Handle<Object>> handlers(target_receiver_maps.length());
+  List<Handle<Object>> handlers(static_cast<int>(target_receiver_maps.size()));
   StoreElementPolymorphicHandlers(&target_receiver_maps, &handlers, store_mode);
-  ConfigureVectorState(Handle<Name>(), &target_receiver_maps, &handlers);
+  if (target_receiver_maps.size() == 0) {
+    ConfigureVectorState(PREMONOMORPHIC, Handle<Name>());
+  } else if (target_receiver_maps.size() == 1) {
+    ConfigureVectorState(Handle<Name>(), target_receiver_maps[0],
+                         handlers.at(0));
+  } else {
+    ConfigureVectorState(Handle<Name>(), target_receiver_maps, &handlers);
+  }
 }
 
 
@@ -2054,7 +2051,6 @@ Handle<Map> KeyedStoreIC::ComputeTransitionedMap(
       return map;
   }
   UNREACHABLE();
-  return MaybeHandle<Map>().ToHandleChecked();
 }
 
 Handle<Object> KeyedStoreIC::StoreElementHandler(
@@ -2089,15 +2085,21 @@ Handle<Object> KeyedStoreIC::StoreElementHandler(
 }
 
 void KeyedStoreIC::StoreElementPolymorphicHandlers(
-    MapHandleList* receiver_maps, List<Handle<Object>>* handlers,
+    MapHandles* receiver_maps, List<Handle<Object>>* handlers,
     KeyedAccessStoreMode store_mode) {
   DCHECK(store_mode == STANDARD_STORE ||
          store_mode == STORE_AND_GROW_NO_TRANSITION ||
          store_mode == STORE_NO_TRANSITION_IGNORE_OUT_OF_BOUNDS ||
          store_mode == STORE_NO_TRANSITION_HANDLE_COW);
 
-  for (int i = 0; i < receiver_maps->length(); ++i) {
-    Handle<Map> receiver_map(receiver_maps->at(i));
+  // Filter out deprecated maps to ensure their instances get migrated.
+  receiver_maps->erase(
+      std::remove_if(
+          receiver_maps->begin(), receiver_maps->end(),
+          [](const Handle<Map>& map) { return map->is_deprecated(); }),
+      receiver_maps->end());
+
+  for (Handle<Map> receiver_map : *receiver_maps) {
     Handle<Object> handler;
     Handle<Map> transitioned_map;
 
@@ -2111,7 +2113,7 @@ void KeyedStoreIC::StoreElementPolymorphicHandlers(
     } else {
       {
         Map* tmap =
-            receiver_map->FindElementsKindTransitionedMap(receiver_maps);
+            receiver_map->FindElementsKindTransitionedMap(*receiver_maps);
         if (tmap != nullptr) {
           if (receiver_map->is_stable()) {
             receiver_map->NotifyLeafMapLayoutChange();
@@ -2247,6 +2249,10 @@ MaybeHandle<Object> KeyedStoreIC::Store(Handle<Object> object,
       TRACE_IC("StoreIC", key);
     }
     return store_handle;
+  }
+
+  if (state() != UNINITIALIZED) {
+    JSObject::MakePrototypesFast(object, kStartAtPrototype, isolate());
   }
 
   bool use_ic = FLAG_use_ic && !object->IsStringWrapper() &&
@@ -2527,158 +2533,6 @@ RUNTIME_FUNCTION(Runtime_ElementsTransitionAndStoreIC_Miss) {
 }
 
 
-MaybeHandle<Object> BinaryOpIC::Transition(
-    Handle<AllocationSite> allocation_site, Handle<Object> left,
-    Handle<Object> right) {
-  BinaryOpICState state(isolate(), extra_ic_state());
-
-  // Compute the actual result using the builtin for the binary operation.
-  Handle<Object> result;
-  switch (state.op()) {
-    default:
-      UNREACHABLE();
-    case Token::ADD:
-      ASSIGN_RETURN_ON_EXCEPTION(isolate(), result,
-                                 Object::Add(isolate(), left, right), Object);
-      break;
-    case Token::SUB:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::Subtract(isolate(), left, right), Object);
-      break;
-    case Token::MUL:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::Multiply(isolate(), left, right), Object);
-      break;
-    case Token::DIV:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::Divide(isolate(), left, right), Object);
-      break;
-    case Token::MOD:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::Modulus(isolate(), left, right), Object);
-      break;
-    case Token::BIT_OR:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::BitwiseOr(isolate(), left, right), Object);
-      break;
-    case Token::BIT_AND:
-      ASSIGN_RETURN_ON_EXCEPTION(isolate(), result,
-                                 Object::BitwiseAnd(isolate(), left, right),
-                                 Object);
-      break;
-    case Token::BIT_XOR:
-      ASSIGN_RETURN_ON_EXCEPTION(isolate(), result,
-                                 Object::BitwiseXor(isolate(), left, right),
-                                 Object);
-      break;
-    case Token::SAR:
-      ASSIGN_RETURN_ON_EXCEPTION(isolate(), result,
-                                 Object::ShiftRight(isolate(), left, right),
-                                 Object);
-      break;
-    case Token::SHR:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::ShiftRightLogical(isolate(), left, right),
-          Object);
-      break;
-    case Token::SHL:
-      ASSIGN_RETURN_ON_EXCEPTION(
-          isolate(), result, Object::ShiftLeft(isolate(), left, right), Object);
-      break;
-  }
-
-  // Do not try to update the target if the code was marked for lazy
-  // deoptimization. (Since we do not relocate addresses in these
-  // code objects, an attempt to access the target could fail.)
-  if (AddressIsDeoptimizedCode()) {
-    return result;
-  }
-
-  // Compute the new state.
-  BinaryOpICState old_state(isolate(), target()->extra_ic_state());
-  state.Update(left, right, result);
-
-  // Check if we have a string operation here.
-  Handle<Code> new_target;
-  if (!allocation_site.is_null() || state.ShouldCreateAllocationMementos()) {
-    // Setup the allocation site on-demand.
-    if (allocation_site.is_null()) {
-      allocation_site = isolate()->factory()->NewAllocationSite();
-    }
-
-    // Install the stub with an allocation site.
-    BinaryOpICWithAllocationSiteStub stub(isolate(), state);
-    new_target = stub.GetCodeCopyFromTemplate(allocation_site);
-
-    // Sanity check the trampoline stub.
-    DCHECK_EQ(*allocation_site, new_target->FindFirstAllocationSite());
-  } else {
-    // Install the generic stub.
-    BinaryOpICStub stub(isolate(), state);
-    new_target = stub.GetCode();
-
-    // Sanity check the generic stub.
-    DCHECK_NULL(new_target->FindFirstAllocationSite());
-  }
-  set_target(*new_target);
-
-  if (FLAG_ic_stats &
-      v8::tracing::TracingCategoryObserver::ENABLED_BY_TRACING) {
-    auto ic_stats = ICStats::instance();
-    ic_stats->Begin();
-    ICInfo& ic_info = ic_stats->Current();
-    ic_info.type = "BinaryOpIC";
-    ic_info.state = old_state.ToString();
-    ic_info.state += " => ";
-    ic_info.state += state.ToString();
-    JavaScriptFrame::CollectTopFrameForICStats(isolate());
-    ic_stats->End();
-  } else if (FLAG_ic_stats) {
-    int line;
-    int column;
-    Address pc = GetAbstractPC(&line, &column);
-    LOG(isolate(),
-        BinaryOpIC(pc, line, column, *new_target, old_state.ToString().c_str(),
-                   state.ToString().c_str(),
-                   allocation_site.is_null() ? nullptr : *allocation_site));
-  }
-
-  // Patch the inlined smi code as necessary.
-  if (!old_state.UseInlinedSmiCode() && state.UseInlinedSmiCode()) {
-    PatchInlinedSmiCode(isolate(), address(), ENABLE_INLINED_SMI_CHECK);
-  } else if (old_state.UseInlinedSmiCode() && !state.UseInlinedSmiCode()) {
-    PatchInlinedSmiCode(isolate(), address(), DISABLE_INLINED_SMI_CHECK);
-  }
-
-  return result;
-}
-
-
-RUNTIME_FUNCTION(Runtime_BinaryOpIC_Miss) {
-  HandleScope scope(isolate);
-  DCHECK_EQ(2, args.length());
-  typedef BinaryOpDescriptor Descriptor;
-  Handle<Object> left = args.at(Descriptor::kLeft);
-  Handle<Object> right = args.at(Descriptor::kRight);
-  BinaryOpIC ic(isolate);
-  RETURN_RESULT_OR_FAILURE(
-      isolate, ic.Transition(Handle<AllocationSite>::null(), left, right));
-}
-
-
-RUNTIME_FUNCTION(Runtime_BinaryOpIC_MissWithAllocationSite) {
-  HandleScope scope(isolate);
-  DCHECK_EQ(3, args.length());
-  typedef BinaryOpWithAllocationSiteDescriptor Descriptor;
-  Handle<AllocationSite> allocation_site =
-      args.at<AllocationSite>(Descriptor::kAllocationSite);
-  Handle<Object> left = args.at(Descriptor::kLeft);
-  Handle<Object> right = args.at(Descriptor::kRight);
-  BinaryOpIC ic(isolate);
-  RETURN_RESULT_OR_FAILURE(isolate,
-                           ic.Transition(allocation_site, left, right));
-}
-
 Code* CompareIC::GetRawUninitialized(Isolate* isolate, Token::Value op) {
   CompareICStub stub(isolate, op, CompareICState::UNINITIALIZED,
                      CompareICState::UNINITIALIZED,
@@ -2764,51 +2618,6 @@ RUNTIME_FUNCTION(Runtime_Unreachable) {
   UNREACHABLE();
   CHECK(false);
   return isolate->heap()->undefined_value();
-}
-
-
-Handle<Object> ToBooleanIC::ToBoolean(Handle<Object> object) {
-  ToBooleanICStub stub(isolate(), extra_ic_state());
-  ToBooleanHints old_hints = stub.hints();
-  bool to_boolean_value = stub.UpdateStatus(object);
-  ToBooleanHints new_hints = stub.hints();
-  Handle<Code> code = stub.GetCode();
-  set_target(*code);
-
-  // Note: Although a no-op transition is semantically OK, it is hinting at a
-  // bug somewhere in our state transition machinery.
-  DCHECK_NE(old_hints, new_hints);
-  if (V8_UNLIKELY(FLAG_ic_stats)) {
-    if (FLAG_ic_stats &
-        v8::tracing::TracingCategoryObserver::ENABLED_BY_TRACING) {
-      auto ic_stats = ICStats::instance();
-      ic_stats->Begin();
-      ICInfo& ic_info = ic_stats->Current();
-      ic_info.type = "ToBooleanIC";
-      ic_info.state = ToString(old_hints);
-      ic_info.state += "=>";
-      ic_info.state += ToString(new_hints);
-      ic_stats->End();
-    } else {
-      int line;
-      int column;
-      Address pc = GetAbstractPC(&line, &column);
-      LOG(isolate(),
-          ToBooleanIC(pc, line, column, *code, ToString(old_hints).c_str(),
-                      ToString(new_hints).c_str()));
-    }
-  }
-
-  return isolate()->factory()->ToBoolean(to_boolean_value);
-}
-
-
-RUNTIME_FUNCTION(Runtime_ToBooleanIC_Miss) {
-  DCHECK(args.length() == 1);
-  HandleScope scope(isolate);
-  Handle<Object> object = args.at(0);
-  ToBooleanIC ic(isolate);
-  return *ic.ToBoolean(object);
 }
 
 

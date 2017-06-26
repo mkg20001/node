@@ -194,9 +194,7 @@ void PropertyHandlerCompiler::GenerateApiAccessorCall(
 
   // Put holder in place.
   CallOptimization::HolderLookup holder_lookup;
-  int holder_depth = 0;
-  optimization.LookupHolderOfExpectedType(receiver_map, &holder_lookup,
-                                          &holder_depth);
+  optimization.LookupHolderOfExpectedType(receiver_map, &holder_lookup);
   switch (holder_lookup) {
     case CallOptimization::kHolderIsReceiver:
       __ Move(holder, receiver);
@@ -204,10 +202,6 @@ void PropertyHandlerCompiler::GenerateApiAccessorCall(
     case CallOptimization::kHolderFound:
       __ LoadP(holder, FieldMemOperand(receiver, HeapObject::kMapOffset));
       __ LoadP(holder, FieldMemOperand(holder, Map::kPrototypeOffset));
-      for (int i = 1; i < holder_depth; i++) {
-        __ LoadP(holder, FieldMemOperand(holder, HeapObject::kMapOffset));
-        __ LoadP(holder, FieldMemOperand(holder, Map::kPrototypeOffset));
-      }
       break;
     case CallOptimization::kHolderNotFound:
       UNREACHABLE();
@@ -216,10 +210,8 @@ void PropertyHandlerCompiler::GenerateApiAccessorCall(
 
   Isolate* isolate = masm->isolate();
   Handle<CallHandlerInfo> api_call_info = optimization.api_call_info();
-  bool call_data_undefined = false;
   // Put call data in place.
   if (api_call_info->data()->IsUndefined(isolate)) {
-    call_data_undefined = true;
     __ LoadRoot(data, Heap::kUndefinedValueRootIndex);
   } else {
     if (optimization.is_constant_call()) {
@@ -244,8 +236,7 @@ void PropertyHandlerCompiler::GenerateApiAccessorCall(
   __ mov(api_function_address, Operand(ref));
 
   // Jump to stub.
-  CallApiCallbackStub stub(isolate, is_store, call_data_undefined,
-                           !optimization.is_constant_call());
+  CallApiCallbackStub stub(isolate, is_store, !optimization.is_constant_call());
   __ TailCallStub(&stub);
 }
 

@@ -133,10 +133,8 @@ class MacroAssembler : public Assembler {
   void Call(Address target, RelocInfo::Mode rmode, Condition cond = al);
   int CallSize(Handle<Code> code,
                RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
-               TypeFeedbackId ast_id = TypeFeedbackId::None(),
                Condition cond = al);
   void Call(Handle<Code> code, RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
-            TypeFeedbackId ast_id = TypeFeedbackId::None(),
             Condition cond = al);
   void Ret() { blr(); }
   void Ret(Condition cond, CRegister cr = cr7) { bclr(cond, cr); }
@@ -917,7 +915,7 @@ class MacroAssembler : public Assembler {
   // Runtime calls
 
   // Call a code stub.
-  void CallStub(CodeStub* stub, TypeFeedbackId ast_id = TypeFeedbackId::None(),
+  void CallStub(CodeStub* stub,
                 Condition cond = al);
 
   // Call a code stub.
@@ -1302,6 +1300,9 @@ class MacroAssembler : public Assembler {
 #else
 #define SmiWordOffset(offset) offset
 #endif
+
+  // Abort execution if argument is not a FixedArray, enabled via --debug-code.
+  void AssertFixedArray(Register object);
 
   void AssertFunction(Register object);
 

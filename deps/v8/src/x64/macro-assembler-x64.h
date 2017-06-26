@@ -817,10 +817,6 @@ class MacroAssembler: public Assembler {
   // Move if the registers are not identical.
   void Move(Register target, Register source);
 
-  void LoadSharedFunctionInfoSpecialField(Register dst,
-                                          Register base,
-                                          int offset);
-
   // Handle support
   void Move(Register dst, Handle<Object> source);
   void Move(const Operand& dst, Handle<Object> source);
@@ -829,6 +825,9 @@ class MacroAssembler: public Assembler {
   void Cmp(Register dst, Smi* src);
   void Cmp(const Operand& dst, Smi* src);
   void Push(Handle<Object> source);
+
+  // Move a Smi or HeapNumber.
+  void MoveNumber(Register dst, double value);
 
   // Load a heap object and handle the case of new-space objects by
   // indirecting via a global cell.
@@ -996,9 +995,7 @@ class MacroAssembler: public Assembler {
   void Call(Address destination, RelocInfo::Mode rmode);
   void Call(ExternalReference ext);
   void Call(const Operand& op);
-  void Call(Handle<Code> code_object,
-            RelocInfo::Mode rmode,
-            TypeFeedbackId ast_id = TypeFeedbackId::None());
+  void Call(Handle<Code> code_object, RelocInfo::Mode rmode);
 
   // The size of the code generated for different call instructions.
   int CallSize(Address destination) {
@@ -1146,6 +1143,9 @@ class MacroAssembler: public Assembler {
   void AssertSmi(Register object);
   void AssertSmi(const Operand& object);
 
+  // Abort execution if argument is not a FixedArray, enabled via --debug-code.
+  void AssertFixedArray(Register object);
+
   // Abort execution if a 64 bit register containing a 32 bit payload does not
   // have zeros in the top 32 bits, enabled via --debug-code.
   void AssertZeroExtended(Register reg);
@@ -1268,7 +1268,7 @@ class MacroAssembler: public Assembler {
   // Runtime calls
 
   // Call a code stub.
-  void CallStub(CodeStub* stub, TypeFeedbackId ast_id = TypeFeedbackId::None());
+  void CallStub(CodeStub* stub);
 
   // Tail call a code stub (jump).
   void TailCallStub(CodeStub* stub);

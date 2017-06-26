@@ -9,13 +9,22 @@
 #include "src/globals.h"
 #include "src/isolate.h"
 #include "src/messages.h"
+#include "src/objects/descriptor-array.h"
+#include "src/objects/dictionary.h"
 #include "src/objects/scope-info.h"
+#include "src/objects/string.h"
+#include "src/string-hasher.h"
 
 namespace v8 {
 namespace internal {
 
+class AliasedArgumentsEntry;
+class BreakPointInfo;
 class BoilerplateDescription;
 class ConstantElementsPair;
+class CoverageInfo;
+class DebugInfo;
+struct SourceRange;
 
 enum FunctionMode {
   // With prototype.
@@ -76,6 +85,13 @@ class V8_EXPORT_PRIVATE Factory final {
 
   Handle<OrderedHashSet> NewOrderedHashSet();
   Handle<OrderedHashMap> NewOrderedHashMap();
+
+  Handle<SmallOrderedHashSet> NewSmallOrderedHashSet(
+      int size = SmallOrderedHashSet::kMinCapacity,
+      PretenureFlag pretenure = NOT_TENURED);
+  Handle<SmallOrderedHashMap> NewSmallOrderedHashMap(
+      int size = SmallOrderedHashMap::kMinCapacity,
+      PretenureFlag pretenure = NOT_TENURED);
 
   // Create a new PrototypeInfo struct.
   Handle<PrototypeInfo> NewPrototypeInfo();
@@ -325,6 +341,10 @@ class V8_EXPORT_PRIVATE Factory final {
 
   Handle<BreakPointInfo> NewBreakPointInfo(int source_position);
   Handle<StackFrameInfo> NewStackFrameInfo();
+  Handle<SourcePositionTableWithFrameCache>
+  NewSourcePositionTableWithFrameCache(
+      Handle<ByteArray> source_position_table,
+      Handle<UnseededNumberDictionary> stack_frame_cache);
 
   // Foreign objects are pretenured when allocated by the bootstrapper.
   Handle<Foreign> NewForeign(Address addr,
@@ -472,6 +492,10 @@ class V8_EXPORT_PRIVATE Factory final {
       Handle<Map> map,
       PretenureFlag pretenure = NOT_TENURED,
       Handle<AllocationSite> allocation_site = Handle<AllocationSite>::null());
+  Handle<JSObject> NewSlowJSObjectFromMap(
+      Handle<Map> map,
+      int number_of_slow_properties = NameDictionary::kInitialCapacity,
+      PretenureFlag pretenure = NOT_TENURED);
 
   // JS arrays are pretenured when allocated by the parser.
 
@@ -730,9 +754,9 @@ class V8_EXPORT_PRIVATE Factory final {
 
   // Allocates a new SharedFunctionInfo object.
   Handle<SharedFunctionInfo> NewSharedFunctionInfo(
-      Handle<String> name, FunctionKind kind, Handle<Code> code,
+      MaybeHandle<String> name, FunctionKind kind, Handle<Code> code,
       Handle<ScopeInfo> scope_info);
-  Handle<SharedFunctionInfo> NewSharedFunctionInfo(Handle<String> name,
+  Handle<SharedFunctionInfo> NewSharedFunctionInfo(MaybeHandle<String> name,
                                                    MaybeHandle<Code> code,
                                                    bool is_constructor);
 
@@ -761,11 +785,12 @@ class V8_EXPORT_PRIVATE Factory final {
 
   Handle<DebugInfo> NewDebugInfo(Handle<SharedFunctionInfo> shared);
 
+  Handle<CoverageInfo> NewCoverageInfo(const ZoneVector<SourceRange>& slots);
+
   // Return a map for given number of properties using the map cache in the
   // native context.
-  Handle<Map> ObjectLiteralMapFromCache(Handle<Context> context,
-                                        int number_of_properties,
-                                        bool* is_result_from_cache);
+  Handle<Map> ObjectLiteralMapFromCache(Handle<Context> native_context,
+                                        int number_of_properties);
 
   Handle<RegExpMatchInfo> NewRegExpMatchInfo();
 

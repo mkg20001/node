@@ -9,6 +9,9 @@
   # Bots are ordered by appearance on waterfall.
   'masters': {
     'developer_default': {
+      'android.arm.debug': 'default_debug_android_arm',
+      'android.arm.optdebug': 'default_optdebug_android_arm',
+      'android.arm.release': 'default_release_android_arm',
       'arm.debug': 'default_debug_arm',
       'arm.optdebug': 'default_optdebug_arm',
       'arm.release': 'default_release_arm',
@@ -47,7 +50,7 @@
       'v8-mac-release': 'gyp_release_x86_disassembler',
     },
     'client.dynamorio': {
-      'linux-v8-dr': 'gyp_release_x64',
+      'linux-v8-dr': 'gn_release_x64',
     },
     'client.v8': {
       # Linux.
@@ -60,6 +63,7 @@
       'V8 Linux - verify csa': 'gn_release_x86_verify_csa',
       # Linux64.
       'V8 Linux64 - builder': 'gn_release_x64_valgrind',
+      'V8 Linux64 - concurrent marking - builder': 'gn_release_x64_concurrent_marking',
       'V8 Linux64 - debug builder': 'gn_debug_x64_valgrind',
       'V8 Linux64 - custom snapshot - debug builder': 'gn_debug_x64_custom',
       'V8 Linux64 - internal snapshot': 'gn_release_x64_internal',
@@ -84,9 +88,25 @@
       # Sanitizers.
       'V8 Linux64 ASAN': 'gn_release_x64_asan',
       'V8 Linux64 TSAN': 'gn_release_x64_tsan',
+      'V8 Linux64 TSAN - concurrent marking':
+          'gn_release_x64_tsan_concurrent_marking',
       'V8 Linux - arm64 - sim - MSAN': 'gn_release_simulate_arm64_msan',
-      # Clusterfuzz.
+      # Misc.
+      'V8 Linux gcc 4.8': 'gn_release_x86_gcc',
+      'V8 Linux64 gcc 4.8 - debug': 'gn_debug_x64_gcc',
+      # FYI.
+      'V8 Linux - swarming staging': 'gn_release_x64',
+      'V8 Linux64 - cfi': 'gn_release_x64_cfi',
+      'V8 Linux - vtunejit': 'gn_debug_x86_vtunejit',
+      'V8 Linux64 - gcov coverage': 'gyp_release_x64_gcc_coverage',
+      'V8 Linux - predictable': 'gn_release_x86_predictable',
+      'V8 Linux - full debug': 'gn_full_debug_x86',
+      'V8 Linux - interpreted regexp': 'gn_release_x86_interpreted_regexp',
+      'V8 Random Deopt Fuzzer - debug': 'gn_debug_x86',
+    },
+    'client.v8.clusterfuzz': {
       'V8 Linux64 - release builder': 'gn_release_x64_correctness_fuzzer',
+      'V8 Linux64 - debug builder': 'gn_debug_x64',
       'V8 Linux64 ASAN no inline - release builder':
           'gn_release_x64_asan_symbolized_edge_verify_heap',
       'V8 Linux64 ASAN - debug builder': 'gn_debug_x64_asan_edge',
@@ -96,22 +116,11 @@
           'gn_debug_simulate_arm_asan_edge',
       'V8 Linux ASAN mipsel - debug builder':
           'gn_debug_simulate_mipsel_asan_edge',
-      # Misc.
-      'V8 Linux gcc 4.8': 'gn_release_x86_gcc',
-      # FYI.
-      'V8 Linux - swarming staging': 'gn_release_x64',
-      # TODO(machenbach): Figure out if symbolized is still needed. The
-      # original config also specified -O1, which we dropped because chromium
-      # doesn't have it (anymore).
-      'V8 Linux64 - cfi': 'gyp_release_x64_cfi_symbolized',
-      'V8 Linux - vtunejit': 'gn_debug_x86_vtunejit',
-      'V8 Linux64 - gcov coverage': 'gyp_release_x64_gcc_coverage',
-      'V8 Linux - predictable': 'gn_release_x86_predictable',
-      'V8 Linux - full debug': 'gyp_full_debug_x86',
-      'V8 Linux - interpreted regexp': 'gn_release_x86_interpreted_regexp',
-      'V8 Random Deopt Fuzzer - debug': 'gyp_debug_x86',
+      'V8 Linux MSAN no origins':
+          'gn_release_simulate_arm64_msan_no_origins_edge',
+      'V8 Linux MSAN chained origins':
+          'gn_release_simulate_arm64_msan_edge',
     },
-
     'client.v8.ports': {
       # Arm.
       'V8 Arm - builder': 'gn_release_arm',
@@ -177,6 +186,7 @@
       'v8_linux_nosnap_dbg': 'gn_debug_x86_no_snap_trybot',
       'v8_linux_gcc_compile_rel': 'gn_release_x86_gcc_minimal_symbols',
       'v8_linux_gcc_rel': 'gn_release_x86_gcc_minimal_symbols',
+      'v8_linux64_gcc_compile_dbg': 'gn_debug_x64_gcc',
       'v8_linux64_rel_ng': 'gn_release_x64_valgrind_trybot',
       'v8_linux64_verify_csa_rel_ng': 'gn_release_x64_verify_csa',
       'v8_linux64_gyp_rel_ng': 'gyp_release_x64',
@@ -187,6 +197,8 @@
       'v8_linux64_sanitizer_coverage_rel':
           'gyp_release_x64_asan_minimal_symbols_coverage',
       'v8_linux64_tsan_rel': 'gn_release_x64_tsan_minimal_symbols',
+      'v8_linux64_tsan_concurrent_marking_rel_ng':
+          'gn_release_x64_tsan_concurrent_marking_minimal_symbols',
       'v8_win_dbg': 'gn_debug_x86_trybot',
       'v8_win_compile_dbg': 'gn_debug_x86_trybot',
       'v8_win_rel_ng': 'gn_release_x86_trybot',
@@ -225,6 +237,14 @@
       'gn', 'debug', 'simulate_arm', 'v8_enable_slow_dchecks'],
     'default_release_arm': [
       'gn', 'release', 'simulate_arm'],
+    'default_debug_android_arm': [
+      'gn', 'debug', 'arm', 'android', 'crosscompile',
+      'v8_enable_slow_dchecks', 'v8_full_debug'],
+    'default_optdebug_android_arm': [
+      'gn', 'debug', 'arm', 'android', 'crosscompile',
+      'v8_enable_slow_dchecks' ],
+    'default_release_android_arm': [
+      'gn', 'release', 'arm', 'android', 'crosscompile'],
     'default_debug_arm64': [
       'gn', 'debug', 'simulate_arm64', 'v8_enable_slow_dchecks',
       'v8_full_debug'],
@@ -298,7 +318,8 @@
     'gn_debug_simulate_arm64_asan_edge': [
       'gn', 'debug_bot', 'simulate_arm64', 'asan', 'lsan', 'edge'],
     'gn_debug_simulate_arm64_no_snap': [
-      'gn', 'debug_bot', 'simulate_arm64', 'swarming', 'v8_snapshot_none'],
+      'gn', 'debug', 'simulate_arm64', 'shared', 'goma',
+      'v8_optimized_debug', 'swarming', 'v8_snapshot_none'],
     'gn_debug_simulate_mipsel_asan_edge': [
       'gn', 'debug_bot', 'simulate_mipsel', 'asan', 'edge'],
 
@@ -314,6 +335,10 @@
     'gn_release_simulate_arm64_msan_minimal_symbols': [
       'gn', 'release_bot', 'simulate_arm64', 'msan', 'minimal_symbols',
       'swarming'],
+    'gn_release_simulate_arm64_msan_edge': [
+      'gn', 'release_bot', 'simulate_arm64', 'edge', 'msan'],
+    'gn_release_simulate_arm64_msan_no_origins_edge': [
+      'gn', 'release_bot', 'simulate_arm64', 'edge', 'msan_no_origins'],
     'gn_release_simulate_arm64_trybot': [
       'gn', 'release_trybot', 'simulate_arm64', 'swarming'],
     'gn_release_simulate_mipsel': [
@@ -348,8 +373,12 @@
     'gn_release_x64_asan_symbolized_edge_verify_heap': [
       'gn', 'release_bot', 'x64', 'asan', 'edge', 'lsan', 'symbolized',
       'v8_verify_heap'],
+    'gn_release_x64_cfi': [
+      'gn', 'release_bot', 'x64', 'cfi', 'swarming'],
     'gn_release_x64_clang': [
       'gn', 'release_bot', 'x64', 'clang', 'swarming'],
+    'gn_release_x64_concurrent_marking': [
+      'gn', 'release_bot', 'x64', 'v8_enable_concurrent_marking', 'swarming'],
     'gn_release_x64_correctness_fuzzer' : [
       'gn', 'release_bot', 'x64', 'v8_correctness_fuzzer'],
     'gn_release_x64_internal': [
@@ -360,6 +389,12 @@
       'gn', 'release_trybot', 'x64', 'swarming'],
     'gn_release_x64_tsan': [
       'gn', 'release_bot', 'x64', 'tsan', 'swarming'],
+    'gn_release_x64_tsan_concurrent_marking': [
+      'gn', 'release_bot', 'x64', 'v8_enable_concurrent_marking', 'tsan',
+      'swarming'],
+    'gn_release_x64_tsan_concurrent_marking_minimal_symbols': [
+      'gn', 'release_bot', 'x64', 'v8_enable_concurrent_marking', 'tsan',
+      'minimal_symbols', 'swarming'],
     'gn_release_x64_tsan_minimal_symbols': [
       'gn', 'release_bot', 'x64', 'tsan', 'minimal_symbols', 'swarming'],
     'gn_release_x64_valgrind': [
@@ -377,6 +412,8 @@
       'gn', 'debug_bot', 'x64', 'asan', 'lsan', 'edge'],
     'gn_debug_x64_custom': [
       'gn', 'debug_bot', 'x64', 'swarming', 'v8_snapshot_custom'],
+    'gn_debug_x64_gcc': [
+      'gn', 'debug_bot', 'x64', 'gcc'],
     'gn_debug_x64_minimal_symbols': [
       'gn', 'debug_bot', 'x64', 'minimal_symbols', 'swarming'],
     'gn_debug_x64_trybot': [
@@ -399,6 +436,9 @@
       'gn', 'debug_trybot', 'x86', 'swarming'],
     'gn_debug_x86_vtunejit': [
       'gn', 'debug_bot', 'x86', 'v8_enable_vtunejit'],
+    'gn_full_debug_x86': [
+      'gn', 'debug', 'x86', 'goma', 'static', 'v8_enable_slow_dchecks',
+      'v8_full_debug'],
 
     # GN release configs for x86.
     'gn_release_x86': [
@@ -438,13 +478,6 @@
     'gyp_debug_simulate_x87': [
       'gyp', 'debug_bot_static', 'simulate_x87', 'swarming'],
 
-    # Gyp debug configs for x86.
-    'gyp_debug_x86': [
-      'gyp', 'debug_bot', 'x86', 'swarming'],
-    'gyp_full_debug_x86': [
-      'gyp', 'debug', 'x86', 'goma', 'static', 'v8_enable_slow_dchecks',
-      'v8_full_debug'],
-
     # Gyp release configs for mips.
     'gyp_release_mips_no_snap_no_i18n': [
       'gyp', 'release', 'mips', 'crosscompile', 'static', 'v8_no_i18n',
@@ -466,8 +499,6 @@
     'gyp_release_x64_asan_minimal_symbols_coverage': [
       'gyp', 'release_bot', 'x64', 'asan', 'bb', 'coverage', 'lsan',
       'minimal_symbols', 'swarming'],
-    'gyp_release_x64_cfi_symbolized': [
-      'gyp', 'release_bot', 'x64', 'cfi', 'swarming', 'symbolized'],
     'gyp_release_x64_gcc_coverage': [
       'gyp', 'release_bot', 'x64', 'coverage', 'gcc'],
 
@@ -498,12 +529,13 @@
     },
 
     'bb': {
-      'gn_args': 'sanitizer_coverage_flags="bb"',
-      'gyp_defines': 'sanitizer_coverage=bb',
+      'gn_args': 'sanitizer_coverage_flags="bb,trace-pc-guard"',
+      'gyp_defines': 'sanitizer_coverage=bb,trace-pc-guard',
     },
 
     'cfi': {
-      'gn_args': 'is_cfi=true use_cfi_diag=true',
+      'gn_args': ('is_cfi=true use_cfi_cast=true use_cfi_diag=true '
+                  'use_cfi_recover=false'),
       'gyp_defines': 'cfi_vptr=1 cfi_diag=1',
     },
 
@@ -548,8 +580,8 @@
     },
 
     'edge': {
-      'gn_args': 'sanitizer_coverage_flags="edge"',
-      'gyp_defines': 'sanitizer_coverage=edge',
+      'gn_args': 'sanitizer_coverage_flags="trace-pc-guard"',
+      'gyp_defines': 'sanitizer_coverage=trace-pc-guard',
     },
 
     'gcc': {
@@ -596,8 +628,11 @@
     'msan': {
       'gn_args': ('is_msan=true msan_track_origins=2 '
                   'use_prebuilt_instrumented_libraries=true'),
-      'gyp_defines': ('clang=1 msan=1 msan_track_origins=2 '
-                      'use_prebuilt_instrumented_libraries=1'),
+    },
+
+    'msan_no_origins': {
+      'gn_args': ('is_msan=true msan_track_origins=0 '
+                  'use_prebuilt_instrumented_libraries=true'),
     },
 
     'release': {
@@ -693,6 +728,10 @@
     'v8_no_i18n': {
       'gn_args': 'v8_enable_i18n_support=false icu_use_data_file=false',
       'gyp_defines': 'v8_enable_i18n_support=0 icu_use_data_file_flag=0',
+    },
+
+    'v8_enable_concurrent_marking': {
+      'gn_args': 'v8_enable_concurrent_marking=true',
     },
 
     'v8_correctness_fuzzer': {

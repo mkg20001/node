@@ -35,6 +35,10 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
     return InputDoubleRegister(index);
   }
 
+  DoubleRegister InputSimd128Register(size_t index) {
+    return InputDoubleRegister(index).Q();
+  }
+
   CPURegister InputFloat32OrZeroRegister(size_t index) {
     if (instr_->InputAt(index)->IsImmediate()) {
       DCHECK(bit_cast<int32_t>(InputFloat32(index)) == 0);
@@ -59,6 +63,8 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
 
   DoubleRegister OutputFloat64Register() { return OutputDoubleRegister(); }
 
+  DoubleRegister OutputSimd128Register() { return OutputDoubleRegister().Q(); }
+
   Register InputRegister32(size_t index) {
     return ToRegister(instr_->InputAt(index)).W();
   }
@@ -81,10 +87,6 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
       return xzr;
     }
     return InputRegister64(index);
-  }
-
-  Operand InputImmediate(size_t index) {
-    return ToImmediate(instr_->InputAt(index));
   }
 
   Operand InputOperand(size_t index) {
@@ -132,7 +134,6 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
         break;
     }
     UNREACHABLE();
-    return Operand(-1);
   }
 
   Operand InputOperand2_64(size_t index) {
@@ -162,7 +163,6 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
         break;
     }
     UNREACHABLE();
-    return Operand(-1);
   }
 
   MemOperand MemoryOperand(size_t* first_index) {
@@ -190,7 +190,6 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
         return MemOperand(InputRegister(index + 0), InputRegister(index + 1));
     }
     UNREACHABLE();
-    return MemOperand(no_reg);
   }
 
   MemOperand MemoryOperand(size_t first_index = 0) {
@@ -228,11 +227,9 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
           return Operand(constant.ToInt64());
         }
       case Constant::kFloat32:
-        return Operand(
-            isolate()->factory()->NewNumber(constant.ToFloat32(), TENURED));
+        return Operand(Operand::EmbeddedNumber(constant.ToFloat32()));
       case Constant::kFloat64:
-        return Operand(
-            isolate()->factory()->NewNumber(constant.ToFloat64(), TENURED));
+        return Operand(Operand::EmbeddedNumber(constant.ToFloat64()));
       case Constant::kExternalReference:
         return Operand(constant.ToExternalReference());
       case Constant::kHeapObject:
@@ -242,7 +239,6 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
         break;
     }
     UNREACHABLE();
-    return Operand(-1);
   }
 
   MemOperand ToMemOperand(InstructionOperand* op, MacroAssembler* masm) const {
@@ -257,7 +253,7 @@ class Arm64OperandConverter final : public InstructionOperandConverter {
       int from_sp = offset.offset() + frame_access_state()->GetSPToFPOffset();
       // Convert FP-offsets to SP-offsets if it results in better code.
       if (Assembler::IsImmLSUnscaled(from_sp) ||
-          Assembler::IsImmLSScaled(from_sp, LSDoubleWord)) {
+          Assembler::IsImmLSScaled(from_sp, 3)) {
         offset = FrameOffset::FromStackPointer(from_sp);
       }
     }
@@ -416,7 +412,6 @@ Condition FlagsConditionToCondition(FlagsCondition condition) {
       return mi;
   }
   UNREACHABLE();
-  return nv;
 }
 
 }  // namespace
@@ -772,8 +767,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kArchPrepareCallCFunction:
       // We don't need kArchPrepareCallCFunction on arm64 as the instruction
-      // selector already perform a Claim to reserve space on the stack and
-      // guarantee correct alignment of stack pointer.
+      // selector has already performed a Claim to reserve space on the stack.
+      // Frame alignment is always 16 bytes, and the stack pointer is already
+      // 16-byte aligned, therefore we do not need to align the stack pointer
+      // by an unknown value, and it is safe to continue accessing the frame
+      // via the stack pointer.
       UNREACHABLE();
       break;
     case kArchPrepareTailCall:
@@ -788,9 +786,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         Register func = i.InputRegister(0);
         __ CallCFunction(func, num_parameters, 0);
       }
-      // CallCFunction only supports register arguments so we never need to call
-      // frame()->ClearOutgoingParameterSlots() here.
-      DCHECK(frame_access_state()->sp_delta() == 0);
+      frame_access_state()->SetFrameAccessToDefault();
+      frame_access_state()->ClearSPDelta();
       break;
     }
     case kArchJmp:
@@ -1228,14 +1225,22 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       Register prev = __ StackPointer();
       if (prev.Is(jssp)) {
         // TODO(titzer): make this a macro-assembler method.
-        // Align the CSP and store the previous JSSP on the stack.
+        // Align the CSP and store the previous JSSP on the stack. We do not
+        // need to modify the SP delta here, as we will continue to access the
+        // frame via JSSP.
         UseScratchRegisterScope scope(masm());
         Register tmp = scope.AcquireX();
 
+        // TODO(arm64): Storing JSSP on the stack is redundant when calling a C
+        // function, as JSSP is callee-saved (we still need to do this when
+        // calling a code object that uses the CSP as the stack pointer). See
+        // the code generation for kArchCallCodeObject vs. kArchCallCFunction
+        // (the latter does not restore CSP/JSSP).
+        // MacroAssembler::CallCFunction() (safely) drops this extra slot
+        // anyway.
         int sp_alignment = __ ActivationFrameAlignment();
         __ Sub(tmp, jssp, kPointerSize);
-        __ And(tmp, tmp, Operand(~static_cast<uint64_t>(sp_alignment - 1)));
-        __ Mov(csp, tmp);
+        __ Bic(csp, tmp, sp_alignment - 1);
         __ Str(jssp, MemOperand(csp));
         if (count > 0) {
           __ SetStackPointer(csp);
@@ -1259,7 +1264,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         if (count > 0) {
           int even = RoundUp(count, 2);
           __ Sub(jssp, csp, count * kPointerSize);
+          // We must also update CSP to maintain stack consistency:
           __ Sub(csp, csp, even * kPointerSize);  // Must always be aligned.
+          __ AssertStackConsistency();
           frame_access_state()->IncreaseSPDelta(even);
         } else {
           __ Mov(jssp, csp);
@@ -1602,6 +1609,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArm64StrD:
       __ Str(i.InputFloat64OrZeroRegister(0), i.MemoryOperand(1));
       break;
+    case kArm64LdrQ:
+      __ Ldr(i.OutputSimd128Register(), i.MemoryOperand());
+      break;
+    case kArm64StrQ:
+      __ Str(i.InputSimd128Register(0), i.MemoryOperand(1));
+      break;
     case kCheckedLoadInt8:
       ASSEMBLE_CHECKED_LOAD_INTEGER(Ldrsb);
       break;
@@ -1733,10 +1746,438 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       ATOMIC_BINOP_CASE(Or, Orr)
       ATOMIC_BINOP_CASE(Xor, Eor)
 #undef ATOMIC_BINOP_CASE
+
+#define SIMD_UNOP_CASE(Op, Instr, FORMAT)            \
+  case Op:                                           \
+    __ Instr(i.OutputSimd128Register().V##FORMAT(),  \
+             i.InputSimd128Register(0).V##FORMAT()); \
+    break;
+#define SIMD_WIDENING_UNOP_CASE(Op, Instr, WIDE, NARROW) \
+  case Op:                                               \
+    __ Instr(i.OutputSimd128Register().V##WIDE(),        \
+             i.InputSimd128Register(0).V##NARROW());     \
+    break;
+#define SIMD_BINOP_CASE(Op, Instr, FORMAT)           \
+  case Op:                                           \
+    __ Instr(i.OutputSimd128Register().V##FORMAT(),  \
+             i.InputSimd128Register(0).V##FORMAT(),  \
+             i.InputSimd128Register(1).V##FORMAT()); \
+    break;
+
+    case kArm64F32x4Splat: {
+      __ Dup(i.OutputSimd128Register().V4S(), i.InputSimd128Register(0).S(), 0);
+      break;
+    }
+    case kArm64F32x4ExtractLane: {
+      __ Mov(i.OutputSimd128Register().S(), i.InputSimd128Register(0).V4S(),
+             i.InputInt8(1));
+      break;
+    }
+    case kArm64F32x4ReplaceLane: {
+      VRegister dst = i.OutputSimd128Register().V4S(),
+                src1 = i.InputSimd128Register(0).V4S();
+      if (!dst.is(src1)) {
+        __ Mov(dst, src1);
+      }
+      __ Mov(dst, i.InputInt8(1), i.InputSimd128Register(2).V4S(), 0);
+      break;
+    }
+      SIMD_UNOP_CASE(kArm64F32x4SConvertI32x4, Scvtf, 4S);
+      SIMD_UNOP_CASE(kArm64F32x4UConvertI32x4, Ucvtf, 4S);
+      SIMD_UNOP_CASE(kArm64F32x4Abs, Fabs, 4S);
+      SIMD_UNOP_CASE(kArm64F32x4Neg, Fneg, 4S);
+      SIMD_UNOP_CASE(kArm64F32x4RecipApprox, Frecpe, 4S);
+      SIMD_UNOP_CASE(kArm64F32x4RecipSqrtApprox, Frsqrte, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4Add, Fadd, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4AddHoriz, Faddp, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4Sub, Fsub, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4Mul, Fmul, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4Min, Fmin, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4Max, Fmax, 4S);
+      SIMD_BINOP_CASE(kArm64F32x4Eq, Fcmeq, 4S);
+    case kArm64F32x4Ne: {
+      VRegister dst = i.OutputSimd128Register().V4S();
+      __ Fcmeq(dst, i.InputSimd128Register(0).V4S(),
+               i.InputSimd128Register(1).V4S());
+      __ Mvn(dst, dst);
+      break;
+    }
+    case kArm64F32x4Lt: {
+      __ Fcmgt(i.OutputSimd128Register().V4S(), i.InputSimd128Register(1).V4S(),
+               i.InputSimd128Register(0).V4S());
+      break;
+    }
+    case kArm64F32x4Le: {
+      __ Fcmge(i.OutputSimd128Register().V4S(), i.InputSimd128Register(1).V4S(),
+               i.InputSimd128Register(0).V4S());
+      break;
+    }
+    case kArm64I32x4Splat: {
+      __ Dup(i.OutputSimd128Register().V4S(), i.InputRegister32(0));
+      break;
+    }
+    case kArm64I32x4ExtractLane: {
+      __ Mov(i.OutputRegister32(), i.InputSimd128Register(0).V4S(),
+             i.InputInt8(1));
+      break;
+    }
+    case kArm64I32x4ReplaceLane: {
+      VRegister dst = i.OutputSimd128Register().V4S(),
+                src1 = i.InputSimd128Register(0).V4S();
+      if (!dst.is(src1)) {
+        __ Mov(dst, src1);
+      }
+      __ Mov(dst, i.InputInt8(1), i.InputRegister32(2));
+      break;
+    }
+      SIMD_UNOP_CASE(kArm64I32x4SConvertF32x4, Fcvtzs, 4S);
+      SIMD_WIDENING_UNOP_CASE(kArm64I32x4SConvertI16x8Low, Sxtl, 4S, 4H);
+      SIMD_WIDENING_UNOP_CASE(kArm64I32x4SConvertI16x8High, Sxtl2, 4S, 8H);
+      SIMD_UNOP_CASE(kArm64I32x4Neg, Neg, 4S);
+    case kArm64I32x4Shl: {
+      __ Shl(i.OutputSimd128Register().V4S(), i.InputSimd128Register(0).V4S(),
+             i.InputInt5(1));
+      break;
+    }
+    case kArm64I32x4ShrS: {
+      __ Sshr(i.OutputSimd128Register().V4S(), i.InputSimd128Register(0).V4S(),
+              i.InputInt5(1));
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I32x4Add, Add, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4AddHoriz, Addp, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4Sub, Sub, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4Mul, Mul, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4MinS, Smin, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4MaxS, Smax, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4Eq, Cmeq, 4S);
+    case kArm64I32x4Ne: {
+      VRegister dst = i.OutputSimd128Register().V4S();
+      __ Cmeq(dst, i.InputSimd128Register(0).V4S(),
+              i.InputSimd128Register(1).V4S());
+      __ Mvn(dst, dst);
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I32x4GtS, Cmgt, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4GeS, Cmge, 4S);
+      SIMD_UNOP_CASE(kArm64I32x4UConvertF32x4, Fcvtzu, 4S);
+      SIMD_WIDENING_UNOP_CASE(kArm64I32x4UConvertI16x8Low, Uxtl, 4S, 4H);
+      SIMD_WIDENING_UNOP_CASE(kArm64I32x4UConvertI16x8High, Uxtl2, 4S, 8H);
+    case kArm64I32x4ShrU: {
+      __ Ushr(i.OutputSimd128Register().V4S(), i.InputSimd128Register(0).V4S(),
+              i.InputInt5(1));
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I32x4MinU, Umin, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4MaxU, Umax, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4GtU, Cmhi, 4S);
+      SIMD_BINOP_CASE(kArm64I32x4GeU, Cmhs, 4S);
+    case kArm64I16x8Splat: {
+      __ Dup(i.OutputSimd128Register().V8H(), i.InputRegister32(0));
+      break;
+    }
+    case kArm64I16x8ExtractLane: {
+      __ Smov(i.OutputRegister32(), i.InputSimd128Register(0).V8H(),
+              i.InputInt8(1));
+      break;
+    }
+    case kArm64I16x8ReplaceLane: {
+      VRegister dst = i.OutputSimd128Register().V8H(),
+                src1 = i.InputSimd128Register(0).V8H();
+      if (!dst.is(src1)) {
+        __ Mov(dst, src1);
+      }
+      __ Mov(dst, i.InputInt8(1), i.InputRegister32(2));
+      break;
+    }
+      SIMD_WIDENING_UNOP_CASE(kArm64I16x8SConvertI8x16Low, Sxtl, 8H, 8B);
+      SIMD_WIDENING_UNOP_CASE(kArm64I16x8SConvertI8x16High, Sxtl2, 8H, 16B);
+      SIMD_UNOP_CASE(kArm64I16x8Neg, Neg, 8H);
+    case kArm64I16x8Shl: {
+      __ Shl(i.OutputSimd128Register().V8H(), i.InputSimd128Register(0).V8H(),
+             i.InputInt5(1));
+      break;
+    }
+    case kArm64I16x8ShrS: {
+      __ Sshr(i.OutputSimd128Register().V8H(), i.InputSimd128Register(0).V8H(),
+              i.InputInt5(1));
+      break;
+    }
+    case kArm64I16x8SConvertI32x4: {
+      VRegister dst = i.OutputSimd128Register(),
+                src0 = i.InputSimd128Register(0),
+                src1 = i.InputSimd128Register(1);
+      UseScratchRegisterScope scope(masm());
+      VRegister temp = scope.AcquireV(kFormat4S);
+      if (dst.is(src1)) {
+        __ Mov(temp, src1.V4S());
+        src1 = temp;
+      }
+      __ Sqxtn(dst.V4H(), src0.V4S());
+      __ Sqxtn2(dst.V8H(), src1.V4S());
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I16x8Add, Add, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8AddSaturateS, Sqadd, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8AddHoriz, Addp, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8Sub, Sub, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8SubSaturateS, Sqsub, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8Mul, Mul, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8MinS, Smin, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8MaxS, Smax, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8Eq, Cmeq, 8H);
+    case kArm64I16x8Ne: {
+      VRegister dst = i.OutputSimd128Register().V8H();
+      __ Cmeq(dst, i.InputSimd128Register(0).V8H(),
+              i.InputSimd128Register(1).V8H());
+      __ Mvn(dst, dst);
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I16x8GtS, Cmgt, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8GeS, Cmge, 8H);
+    case kArm64I16x8UConvertI8x16Low: {
+      __ Uxtl(i.OutputSimd128Register().V8H(), i.InputSimd128Register(0).V8B());
+      break;
+    }
+    case kArm64I16x8UConvertI8x16High: {
+      __ Uxtl2(i.OutputSimd128Register().V8H(),
+               i.InputSimd128Register(0).V16B());
+      break;
+    }
+    case kArm64I16x8ShrU: {
+      __ Ushr(i.OutputSimd128Register().V8H(), i.InputSimd128Register(0).V8H(),
+              i.InputInt5(1));
+      break;
+    }
+    case kArm64I16x8UConvertI32x4: {
+      VRegister dst = i.OutputSimd128Register(),
+                src0 = i.InputSimd128Register(0),
+                src1 = i.InputSimd128Register(1);
+      UseScratchRegisterScope scope(masm());
+      VRegister temp = scope.AcquireV(kFormat4S);
+      if (dst.is(src1)) {
+        __ Mov(temp, src1.V4S());
+        src1 = temp;
+      }
+      __ Uqxtn(dst.V4H(), src0.V4S());
+      __ Uqxtn2(dst.V8H(), src1.V4S());
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I16x8AddSaturateU, Uqadd, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8SubSaturateU, Uqsub, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8MinU, Umin, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8MaxU, Umax, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8GtU, Cmhi, 8H);
+      SIMD_BINOP_CASE(kArm64I16x8GeU, Cmhs, 8H);
+    case kArm64I8x16Splat: {
+      __ Dup(i.OutputSimd128Register().V16B(), i.InputRegister32(0));
+      break;
+    }
+    case kArm64I8x16ExtractLane: {
+      __ Smov(i.OutputRegister32(), i.InputSimd128Register(0).V16B(),
+              i.InputInt8(1));
+      break;
+    }
+    case kArm64I8x16ReplaceLane: {
+      VRegister dst = i.OutputSimd128Register().V16B(),
+                src1 = i.InputSimd128Register(0).V16B();
+      if (!dst.is(src1)) {
+        __ Mov(dst, src1);
+      }
+      __ Mov(dst, i.InputInt8(1), i.InputRegister32(2));
+      break;
+    }
+      SIMD_UNOP_CASE(kArm64I8x16Neg, Neg, 16B);
+    case kArm64I8x16Shl: {
+      __ Shl(i.OutputSimd128Register().V16B(), i.InputSimd128Register(0).V16B(),
+             i.InputInt5(1));
+      break;
+    }
+    case kArm64I8x16ShrS: {
+      __ Sshr(i.OutputSimd128Register().V16B(),
+              i.InputSimd128Register(0).V16B(), i.InputInt5(1));
+      break;
+    }
+    case kArm64I8x16SConvertI16x8: {
+      VRegister dst = i.OutputSimd128Register(),
+                src0 = i.InputSimd128Register(0),
+                src1 = i.InputSimd128Register(1);
+      UseScratchRegisterScope scope(masm());
+      VRegister temp = scope.AcquireV(kFormat8H);
+      if (dst.is(src1)) {
+        __ Mov(temp, src1.V8H());
+        src1 = temp;
+      }
+      __ Sqxtn(dst.V8B(), src0.V8H());
+      __ Sqxtn2(dst.V16B(), src1.V8H());
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I8x16Add, Add, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16AddSaturateS, Sqadd, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16Sub, Sub, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16SubSaturateS, Sqsub, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16Mul, Mul, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16MinS, Smin, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16MaxS, Smax, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16Eq, Cmeq, 16B);
+    case kArm64I8x16Ne: {
+      VRegister dst = i.OutputSimd128Register().V16B();
+      __ Cmeq(dst, i.InputSimd128Register(0).V16B(),
+              i.InputSimd128Register(1).V16B());
+      __ Mvn(dst, dst);
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I8x16GtS, Cmgt, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16GeS, Cmge, 16B);
+    case kArm64I8x16ShrU: {
+      __ Ushr(i.OutputSimd128Register().V16B(),
+              i.InputSimd128Register(0).V16B(), i.InputInt5(1));
+      break;
+    }
+    case kArm64I8x16UConvertI16x8: {
+      VRegister dst = i.OutputSimd128Register(),
+                src0 = i.InputSimd128Register(0),
+                src1 = i.InputSimd128Register(1);
+      UseScratchRegisterScope scope(masm());
+      VRegister temp = scope.AcquireV(kFormat8H);
+      if (dst.is(src1)) {
+        __ Mov(temp, src1.V8H());
+        src1 = temp;
+      }
+      __ Uqxtn(dst.V8B(), src0.V8H());
+      __ Uqxtn2(dst.V16B(), src1.V8H());
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64I8x16AddSaturateU, Uqadd, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16SubSaturateU, Uqsub, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16MinU, Umin, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16MaxU, Umax, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16GtU, Cmhi, 16B);
+      SIMD_BINOP_CASE(kArm64I8x16GeU, Cmhs, 16B);
+    case kArm64S128Zero: {
+      __ Movi(i.OutputSimd128Register().V16B(), 0);
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64S128And, And, 16B);
+      SIMD_BINOP_CASE(kArm64S128Or, Orr, 16B);
+      SIMD_BINOP_CASE(kArm64S128Xor, Eor, 16B);
+      SIMD_UNOP_CASE(kArm64S128Not, Mvn, 16B);
+    case kArm64S128Select: {
+      VRegister dst = i.OutputSimd128Register().V16B();
+      DCHECK(dst.is(i.InputSimd128Register(0).V16B()));
+      __ Bsl(dst, i.InputSimd128Register(1).V16B(),
+             i.InputSimd128Register(2).V16B());
+      break;
+    }
+    case kArm64S32x4Shuffle: {
+      Simd128Register dst = i.OutputSimd128Register().V4S(),
+                      src0 = i.InputSimd128Register(0).V4S(),
+                      src1 = i.InputSimd128Register(1).V4S();
+      // Check for in-place shuffles.
+      // If dst == src0 == src1, then the shuffle is unary and we only use src0.
+      UseScratchRegisterScope scope(masm());
+      VRegister temp = scope.AcquireV(kFormat4S);
+      if (dst.is(src0)) {
+        __ Mov(temp, src0);
+        src0 = temp;
+      } else if (dst.is(src1)) {
+        __ Mov(temp, src1);
+        src1 = temp;
+      }
+      // Perform shuffle as a vmov per lane.
+      int32_t shuffle = i.InputInt32(2);
+      for (int i = 0; i < 4; i++) {
+        VRegister src = src0;
+        int lane = shuffle & 0x7;
+        if (lane >= 4) {
+          src = src1;
+          lane &= 0x3;
+        }
+        __ Mov(dst, i, src, lane);
+        shuffle >>= 8;
+      }
+      break;
+    }
+      SIMD_BINOP_CASE(kArm64S32x4ZipLeft, Zip1, 4S);
+      SIMD_BINOP_CASE(kArm64S32x4ZipRight, Zip2, 4S);
+      SIMD_BINOP_CASE(kArm64S32x4UnzipLeft, Uzp1, 4S);
+      SIMD_BINOP_CASE(kArm64S32x4UnzipRight, Uzp2, 4S);
+      SIMD_BINOP_CASE(kArm64S32x4TransposeLeft, Trn1, 4S);
+      SIMD_BINOP_CASE(kArm64S32x4TransposeRight, Trn2, 4S);
+      SIMD_BINOP_CASE(kArm64S16x8ZipLeft, Zip1, 8H);
+      SIMD_BINOP_CASE(kArm64S16x8ZipRight, Zip2, 8H);
+      SIMD_BINOP_CASE(kArm64S16x8UnzipLeft, Uzp1, 8H);
+      SIMD_BINOP_CASE(kArm64S16x8UnzipRight, Uzp2, 8H);
+      SIMD_BINOP_CASE(kArm64S16x8TransposeLeft, Trn1, 8H);
+      SIMD_BINOP_CASE(kArm64S16x8TransposeRight, Trn2, 8H);
+      SIMD_BINOP_CASE(kArm64S8x16ZipLeft, Zip1, 16B);
+      SIMD_BINOP_CASE(kArm64S8x16ZipRight, Zip2, 16B);
+      SIMD_BINOP_CASE(kArm64S8x16UnzipLeft, Uzp1, 16B);
+      SIMD_BINOP_CASE(kArm64S8x16UnzipRight, Uzp2, 16B);
+      SIMD_BINOP_CASE(kArm64S8x16TransposeLeft, Trn1, 16B);
+      SIMD_BINOP_CASE(kArm64S8x16TransposeRight, Trn2, 16B);
+    case kArm64S8x16Concat: {
+      __ Ext(i.OutputSimd128Register().V16B(), i.InputSimd128Register(0).V16B(),
+             i.InputSimd128Register(1).V16B(), i.InputInt4(2));
+      break;
+    }
+    case kArm64S8x16Shuffle: {
+      Simd128Register dst = i.OutputSimd128Register().V16B(),
+                      src0 = i.InputSimd128Register(0).V16B(),
+                      src1 = i.InputSimd128Register(1).V16B();
+      // Unary shuffle table is in src0, binary shuffle table is in src0, src1,
+      // which must be consecutive.
+      int64_t mask = 0;
+      if (src0.is(src1)) {
+        mask = 0x0F0F0F0F;
+      } else {
+        mask = 0x1F1F1F1F;
+        DCHECK(AreConsecutive(src0, src1));
+      }
+      int64_t imm1 =
+          (i.InputInt32(2) & mask) | ((i.InputInt32(3) & mask) << 32);
+      int64_t imm2 =
+          (i.InputInt32(4) & mask) | ((i.InputInt32(5) & mask) << 32);
+      UseScratchRegisterScope scope(masm());
+      VRegister temp = scope.AcquireV(kFormat16B);
+      __ Movi(temp, imm2, imm1);
+
+      if (src0.is(src1)) {
+        __ Tbl(dst, src0, temp.V16B());
+      } else {
+        __ Tbl(dst, src0, src1, temp.V16B());
+      }
+      break;
+    }
+      SIMD_UNOP_CASE(kArm64S32x2Reverse, Rev64, 4S);
+      SIMD_UNOP_CASE(kArm64S16x4Reverse, Rev64, 8H);
+      SIMD_UNOP_CASE(kArm64S16x2Reverse, Rev32, 8H);
+      SIMD_UNOP_CASE(kArm64S8x8Reverse, Rev64, 16B);
+      SIMD_UNOP_CASE(kArm64S8x4Reverse, Rev32, 16B);
+      SIMD_UNOP_CASE(kArm64S8x2Reverse, Rev16, 16B);
+
+#define SIMD_REDUCE_OP_CASE(Op, Instr, format, FORMAT)     \
+  case Op: {                                               \
+    UseScratchRegisterScope scope(masm());                 \
+    VRegister temp = scope.AcquireV(format);               \
+    __ Instr(temp, i.InputSimd128Register(0).V##FORMAT()); \
+    __ Umov(i.OutputRegister32(), temp, 0);                \
+    break;                                                 \
+  }
+      SIMD_REDUCE_OP_CASE(kArm64S1x4AnyTrue, Umaxv, kFormatS, 4S);
+      SIMD_REDUCE_OP_CASE(kArm64S1x4AllTrue, Uminv, kFormatS, 4S);
+      SIMD_REDUCE_OP_CASE(kArm64S1x8AnyTrue, Umaxv, kFormatH, 8H);
+      SIMD_REDUCE_OP_CASE(kArm64S1x8AllTrue, Uminv, kFormatH, 8H);
+      SIMD_REDUCE_OP_CASE(kArm64S1x16AnyTrue, Umaxv, kFormatB, 16B);
+      SIMD_REDUCE_OP_CASE(kArm64S1x16AllTrue, Uminv, kFormatB, 16B);
   }
   return kSuccess;
 }  // NOLINT(readability/fn_size)
 
+#undef SIMD_UNOP_CASE
+#undef SIMD_WIDENING_UNOP_CASE
+#undef SIMD_BINOP_CASE
+#undef SIMD_REDUCE_OP_CASE
 
 // Assemble branches after this instruction.
 void CodeGenerator::AssembleArchBranch(Instruction* instr, BranchInfo* branch) {
@@ -1841,7 +2282,7 @@ void CodeGenerator::AssembleArchTrap(Instruction* instr,
         // Initialize the jssp because it is required for the runtime call.
         __ Mov(jssp, csp);
         gen_->AssembleSourcePosition(instr_);
-        __ Call(handle(isolate()->builtins()->builtin(trap_id), isolate()),
+        __ Call(isolate()->builtins()->builtin_handle(trap_id),
                 RelocInfo::CODE_TARGET);
         ReferenceMap* reference_map =
             new (gen_->zone()) ReferenceMap(gen_->zone());
@@ -1920,7 +2361,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleDeoptimizerCall(
   Address deopt_entry = Deoptimizer::GetDeoptimizationEntry(
       isolate(), deoptimization_id, bailout_type);
   if (deopt_entry == nullptr) return kTooManyDeoptimizationBailouts;
-  if (isolate()->NeedsSourcePositionsForProfiling()) {
+  if (info()->is_source_positions_enabled()) {
     __ RecordDeoptReason(deoptimization_reason, pos, deoptimization_id);
   }
   __ Call(deopt_entry, RelocInfo::RUNTIME_ENTRY);
@@ -1938,11 +2379,11 @@ void CodeGenerator::FinishFrame(Frame* frame) {
   }
 
   // Save FP registers.
-  CPURegList saves_fp = CPURegList(CPURegister::kFPRegister, kDRegSizeInBits,
+  CPURegList saves_fp = CPURegList(CPURegister::kVRegister, kDRegSizeInBits,
                                    descriptor->CalleeSavedFPRegisters());
   int saved_count = saves_fp.Count();
   if (saved_count != 0) {
-    DCHECK(saves_fp.list() == CPURegList::GetCalleeSavedFP().list());
+    DCHECK(saves_fp.list() == CPURegList::GetCalleeSavedV().list());
     frame->AllocateSavedCalleeRegisterSlots(saved_count *
                                             (kDoubleSize / kPointerSize));
   }
@@ -1992,8 +2433,55 @@ void CodeGenerator::AssembleConstructFrame() {
       // remaining stack slots.
       if (FLAG_code_comments) __ RecordComment("-- OSR entrypoint --");
       osr_pc_offset_ = __ pc_offset();
-      shrink_slots -= OsrHelper(info()).UnoptimizedFrameSlots();
+      shrink_slots -= osr_helper()->UnoptimizedFrameSlots();
     }
+
+    if (info()->IsWasm() && shrink_slots > 128) {
+      // For WebAssembly functions with big frames we have to do the stack
+      // overflow check before we construct the frame. Otherwise we may not
+      // have enough space on the stack to call the runtime for the stack
+      // overflow.
+      Label done;
+      // If the frame is bigger than the stack, we throw the stack overflow
+      // exception unconditionally. Thereby we can avoid the integer overflow
+      // check in the condition code.
+      if (shrink_slots * kPointerSize < FLAG_stack_size * 1024) {
+        UseScratchRegisterScope scope(masm());
+        Register scratch = scope.AcquireX();
+        __ Mov(
+            scratch,
+            Operand(ExternalReference::address_of_real_stack_limit(isolate())));
+        __ Ldr(scratch, MemOperand(scratch));
+        __ Add(scratch, scratch, Operand(shrink_slots * kPointerSize));
+        __ Cmp(__ StackPointer(), scratch);
+        __ B(cs, &done);
+      }
+
+      if (!frame_access_state()->has_frame()) {
+        __ set_has_frame(true);
+        // There is no need to leave the frame, we will not return from the
+        // runtime call.
+        __ EnterFrame(StackFrame::WASM_COMPILED);
+      }
+      DCHECK(__ StackPointer().Is(csp));
+      __ SetStackPointer(jssp);
+      __ AssertStackConsistency();
+      // Initialize the jssp because it is required for the runtime call.
+      __ Mov(jssp, csp);
+      __ Move(cp, Smi::kZero);
+      __ CallRuntime(Runtime::kThrowWasmStackOverflow);
+      // We come from WebAssembly, there are no references for the GC.
+      ReferenceMap* reference_map = new (zone()) ReferenceMap(zone());
+      RecordSafepoint(reference_map, Safepoint::kSimple, 0,
+                      Safepoint::kNoLazyDeopt);
+      if (FLAG_debug_code) {
+        __ Brk(0);
+      }
+      __ SetStackPointer(csp);
+      __ AssertStackConsistency();
+      __ bind(&done);
+    }
+
     // Build remainder of frame, including accounting for and filling-in
     // frame-specific header information, e.g. claiming the extra slot that
     // other platforms explicitly push for STUB frames and frames recording
@@ -2014,11 +2502,11 @@ void CodeGenerator::AssembleConstructFrame() {
   }
 
   // Save FP registers.
-  CPURegList saves_fp = CPURegList(CPURegister::kFPRegister, kDRegSizeInBits,
+  CPURegList saves_fp = CPURegList(CPURegister::kVRegister, kDRegSizeInBits,
                                    descriptor->CalleeSavedFPRegisters());
   int saved_count = saves_fp.Count();
   if (saved_count != 0) {
-    DCHECK(saves_fp.list() == CPURegList::GetCalleeSavedFP().list());
+    DCHECK(saves_fp.list() == CPURegList::GetCalleeSavedV().list());
     __ PushCPURegList(saves_fp);
   }
   // Save registers.
@@ -2044,7 +2532,7 @@ void CodeGenerator::AssembleReturn(InstructionOperand* pop) {
   }
 
   // Restore fp registers.
-  CPURegList saves_fp = CPURegList(CPURegister::kFPRegister, kDRegSizeInBits,
+  CPURegList saves_fp = CPURegList(CPURegister::kVRegister, kDRegSizeInBits,
                                    descriptor->CalleeSavedFPRegisters());
   if (saves_fp.Count() != 0) {
     __ PopCPURegList(saves_fp);
@@ -2144,7 +2632,7 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
       }
     } else if (src.type() == Constant::kFloat32) {
       if (destination->IsFPRegister()) {
-        FPRegister dst = g.ToDoubleRegister(destination).S();
+        VRegister dst = g.ToDoubleRegister(destination).S();
         __ Fmov(dst, src.ToFloat32());
       } else {
         DCHECK(destination->IsFPStackSlot());
@@ -2152,7 +2640,7 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
           __ Str(wzr, g.ToMemOperand(destination, masm()));
         } else {
           UseScratchRegisterScope scope(masm());
-          FPRegister temp = scope.AcquireS();
+          VRegister temp = scope.AcquireS();
           __ Fmov(temp, src.ToFloat32());
           __ Str(temp, g.ToMemOperand(destination, masm()));
         }
@@ -2160,7 +2648,7 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
     } else {
       DCHECK_EQ(Constant::kFloat64, src.type());
       if (destination->IsFPRegister()) {
-        FPRegister dst = g.ToDoubleRegister(destination);
+        VRegister dst = g.ToDoubleRegister(destination);
         __ Fmov(dst, src.ToFloat64());
       } else {
         DCHECK(destination->IsFPStackSlot());
@@ -2168,31 +2656,47 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
           __ Str(xzr, g.ToMemOperand(destination, masm()));
         } else {
           UseScratchRegisterScope scope(masm());
-          FPRegister temp = scope.AcquireD();
+          VRegister temp = scope.AcquireD();
           __ Fmov(temp, src.ToFloat64());
           __ Str(temp, g.ToMemOperand(destination, masm()));
         }
       }
     }
   } else if (source->IsFPRegister()) {
-    FPRegister src = g.ToDoubleRegister(source);
+    VRegister src = g.ToDoubleRegister(source);
     if (destination->IsFPRegister()) {
-      FPRegister dst = g.ToDoubleRegister(destination);
+      VRegister dst = g.ToDoubleRegister(destination);
       __ Fmov(dst, src);
     } else {
       DCHECK(destination->IsFPStackSlot());
-      __ Str(src, g.ToMemOperand(destination, masm()));
+      MemOperand dst = g.ToMemOperand(destination, masm());
+      if (destination->IsSimd128StackSlot()) {
+        __ Str(src.Q(), dst);
+      } else {
+        __ Str(src, dst);
+      }
     }
   } else if (source->IsFPStackSlot()) {
     DCHECK(destination->IsFPRegister() || destination->IsFPStackSlot());
     MemOperand src = g.ToMemOperand(source, masm());
     if (destination->IsFPRegister()) {
-      __ Ldr(g.ToDoubleRegister(destination), src);
+      VRegister dst = g.ToDoubleRegister(destination);
+      if (destination->IsSimd128Register()) {
+        __ Ldr(dst.Q(), src);
+      } else {
+        __ Ldr(dst, src);
+      }
     } else {
       UseScratchRegisterScope scope(masm());
-      FPRegister temp = scope.AcquireD();
-      __ Ldr(temp, src);
-      __ Str(temp, g.ToMemOperand(destination, masm()));
+      VRegister temp = scope.AcquireD();
+      MemOperand dst = g.ToMemOperand(destination, masm());
+      if (destination->IsSimd128StackSlot()) {
+        __ Ldr(temp.Q(), src);
+        __ Str(temp.Q(), dst);
+      } else {
+        __ Ldr(temp, src);
+        __ Str(temp, dst);
+      }
     }
   } else {
     UNREACHABLE();
@@ -2224,29 +2728,42 @@ void CodeGenerator::AssembleSwap(InstructionOperand* source,
     }
   } else if (source->IsStackSlot() || source->IsFPStackSlot()) {
     UseScratchRegisterScope scope(masm());
-    DoubleRegister temp_0 = scope.AcquireD();
-    DoubleRegister temp_1 = scope.AcquireD();
+    VRegister temp_0 = scope.AcquireD();
+    VRegister temp_1 = scope.AcquireD();
     MemOperand src = g.ToMemOperand(source, masm());
     MemOperand dst = g.ToMemOperand(destination, masm());
-    __ Ldr(temp_0, src);
-    __ Ldr(temp_1, dst);
-    __ Str(temp_0, dst);
-    __ Str(temp_1, src);
+    if (source->IsSimd128StackSlot()) {
+      __ Ldr(temp_0.Q(), src);
+      __ Ldr(temp_1.Q(), dst);
+      __ Str(temp_0.Q(), dst);
+      __ Str(temp_1.Q(), src);
+    } else {
+      __ Ldr(temp_0, src);
+      __ Ldr(temp_1, dst);
+      __ Str(temp_0, dst);
+      __ Str(temp_1, src);
+    }
   } else if (source->IsFPRegister()) {
     UseScratchRegisterScope scope(masm());
-    FPRegister temp = scope.AcquireD();
-    FPRegister src = g.ToDoubleRegister(source);
+    VRegister temp = scope.AcquireD();
+    VRegister src = g.ToDoubleRegister(source);
     if (destination->IsFPRegister()) {
-      FPRegister dst = g.ToDoubleRegister(destination);
+      VRegister dst = g.ToDoubleRegister(destination);
       __ Fmov(temp, src);
       __ Fmov(src, dst);
       __ Fmov(dst, temp);
     } else {
       DCHECK(destination->IsFPStackSlot());
       MemOperand dst = g.ToMemOperand(destination, masm());
-      __ Fmov(temp, src);
-      __ Ldr(src, dst);
-      __ Str(temp, dst);
+      if (source->IsSimd128Register()) {
+        __ Fmov(temp.Q(), src.Q());
+        __ Ldr(src.Q(), dst);
+        __ Str(temp.Q(), dst);
+      } else {
+        __ Fmov(temp, src);
+        __ Ldr(src, dst);
+        __ Str(temp, dst);
+      }
     }
   } else {
     // No other combinations are possible.

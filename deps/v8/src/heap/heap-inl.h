@@ -23,6 +23,9 @@
 #include "src/msan.h"
 #include "src/objects-inl.h"
 #include "src/objects/scope-info.h"
+#include "src/objects/script-inl.h"
+#include "src/profiler/heap-profiler.h"
+#include "src/string-hasher.h"
 
 namespace v8 {
 namespace internal {
@@ -37,23 +40,21 @@ HeapObject* AllocationResult::ToObjectChecked() {
   return HeapObject::cast(object_);
 }
 
-void PromotionQueue::insert(HeapObject* target, int32_t size,
-                            bool was_marked_black) {
+void PromotionQueue::insert(HeapObject* target, int32_t size) {
   if (emergency_stack_ != NULL) {
-    emergency_stack_->Add(Entry(target, size, was_marked_black));
+    emergency_stack_->Add(Entry(target, size));
     return;
   }
 
   if ((rear_ - 1) < limit_) {
     RelocateQueueHead();
-    emergency_stack_->Add(Entry(target, size, was_marked_black));
+    emergency_stack_->Add(Entry(target, size));
     return;
   }
 
   struct Entry* entry = reinterpret_cast<struct Entry*>(--rear_);
   entry->obj_ = target;
   entry->size_ = size;
-  entry->was_marked_black_ = was_marked_black;
 
 // Assert no overflow into live objects.
 #ifdef DEBUG
@@ -62,21 +63,18 @@ void PromotionQueue::insert(HeapObject* target, int32_t size,
 #endif
 }
 
-void PromotionQueue::remove(HeapObject** target, int32_t* size,
-                            bool* was_marked_black) {
+void PromotionQueue::remove(HeapObject** target, int32_t* size) {
   DCHECK(!is_empty());
   if (front_ == rear_) {
     Entry e = emergency_stack_->RemoveLast();
     *target = e.obj_;
     *size = e.size_;
-    *was_marked_black = e.was_marked_black_;
     return;
   }
 
   struct Entry* entry = reinterpret_cast<struct Entry*>(--front_);
   *target = entry->obj_;
   *size = entry->size_;
-  *was_marked_black = entry->was_marked_black_;
 
   // Assert no underflow.
   SemiSpace::AssertValidRange(reinterpret_cast<Address>(rear_),
@@ -239,7 +237,7 @@ AllocationResult Heap::AllocateOneByteInternalizedString(
   }
 
   // String maps are all immortal immovable objects.
-  result->set_map_no_write_barrier(map);
+  result->set_map_after_allocation(map, SKIP_WRITE_BARRIER);
   // Set length and hash fields of the allocated string.
   String* answer = String::cast(result);
   answer->set_length(str.length());
@@ -270,7 +268,7 @@ AllocationResult Heap::AllocateTwoByteInternalizedString(Vector<const uc16> str,
     if (!allocation.To(&result)) return allocation;
   }
 
-  result->set_map(map);
+  result->set_map_after_allocation(map);
   // Set length and hash fields of the allocated string.
   String* answer = String::cast(result);
   answer->set_length(str.length());
@@ -371,7 +369,7 @@ void Heap::OnAllocationEvent(HeapObject* object, int size_in_bytes) {
     UpdateAllocationsHash(size_in_bytes);
 
     if (allocations_count_ % FLAG_dump_allocations_digest_at_alloc == 0) {
-      PrintAlloctionsHash();
+      PrintAllocationsHash();
     }
   }
 
@@ -406,7 +404,7 @@ void Heap::OnMoveEvent(HeapObject* target, HeapObject* source,
     UpdateAllocationsHash(size_in_bytes);
 
     if (allocations_count_ % FLAG_dump_allocations_digest_at_alloc == 0) {
-      PrintAlloctionsHash();
+      PrintAllocationsHash();
     }
   }
 }
@@ -495,7 +493,7 @@ bool Heap::InOldSpaceSlow(Address address) {
   return old_space_->ContainsSlow(address);
 }
 
-bool Heap::ShouldBePromoted(Address old_address, int object_size) {
+bool Heap::ShouldBePromoted(Address old_address) {
   Page* page = Page::FromAddress(old_address);
   Address age_mark = new_space_->age_mark();
   return page->IsFlagSet(MemoryChunk::NEW_SPACE_BELOW_AGE_MARK) &&
@@ -526,39 +524,6 @@ void Heap::RecordFixedArrayElements(FixedArray* array, int offset, int length) {
 
 Address* Heap::store_buffer_top_address() {
   return store_buffer()->top_address();
-}
-
-bool Heap::AllowedToBeMigrated(HeapObject* obj, AllocationSpace dst) {
-  // Object migration is governed by the following rules:
-  //
-  // 1) Objects in new-space can be migrated to the old space
-  //    that matches their target space or they stay in new-space.
-  // 2) Objects in old-space stay in the same space when migrating.
-  // 3) Fillers (two or more words) can migrate due to left-trimming of
-  //    fixed arrays in new-space or old space.
-  // 4) Fillers (one word) can never migrate, they are skipped by
-  //    incremental marking explicitly to prevent invalid pattern.
-  //
-  // Since this function is used for debugging only, we do not place
-  // asserts here, but check everything explicitly.
-  if (obj->map() == one_pointer_filler_map()) return false;
-  InstanceType type = obj->map()->instance_type();
-  MemoryChunk* chunk = MemoryChunk::FromAddress(obj->address());
-  AllocationSpace src = chunk->owner()->identity();
-  switch (src) {
-    case NEW_SPACE:
-      return dst == src || dst == OLD_SPACE;
-    case OLD_SPACE:
-      return dst == src &&
-             (dst == OLD_SPACE || obj->IsFiller() || obj->IsExternalString());
-    case CODE_SPACE:
-      return dst == src && type == CODE_TYPE;
-    case MAP_SPACE:
-    case LO_SPACE:
-      return false;
-  }
-  UNREACHABLE();
-  return false;
 }
 
 void Heap::CopyBlock(Address dst, Address src, int byte_size) {
@@ -625,7 +590,6 @@ AllocationMemento* Heap::FindAllocationMemento(HeapObject* object) {
       UNREACHABLE();
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 template <Heap::UpdateAllocationSiteMode mode>
@@ -677,15 +641,6 @@ void Heap::RemoveAllocationSitePretenuringFeedback(AllocationSite* site) {
       site, static_cast<uint32_t>(bit_cast<uintptr_t>(site)));
 }
 
-bool Heap::CollectGarbage(AllocationSpace space,
-                          GarbageCollectionReason gc_reason,
-                          const v8::GCCallbackFlags callbackFlags) {
-  const char* collector_reason = NULL;
-  GarbageCollector collector = SelectGarbageCollector(space, &collector_reason);
-  return CollectGarbage(collector, gc_reason, collector_reason, callbackFlags);
-}
-
-
 Isolate* Heap::isolate() {
   return reinterpret_cast<Isolate*>(
       reinterpret_cast<intptr_t>(this) -
@@ -706,18 +661,20 @@ void Heap::ExternalStringTable::AddString(String* string) {
   }
 }
 
-void Heap::ExternalStringTable::IterateNewSpaceStrings(ObjectVisitor* v) {
+void Heap::ExternalStringTable::IterateNewSpaceStrings(RootVisitor* v) {
   if (!new_space_strings_.is_empty()) {
     Object** start = &new_space_strings_[0];
-    v->VisitPointers(start, start + new_space_strings_.length());
+    v->VisitRootPointers(Root::kExternalStringsTable, start,
+                         start + new_space_strings_.length());
   }
 }
 
-void Heap::ExternalStringTable::IterateAll(ObjectVisitor* v) {
+void Heap::ExternalStringTable::IterateAll(RootVisitor* v) {
   IterateNewSpaceStrings(v);
   if (!old_space_strings_.is_empty()) {
     Object** start = &old_space_strings_[0];
-    v->VisitPointers(start, start + old_space_strings_.length());
+    v->VisitRootPointers(Root::kExternalStringsTable, start,
+                         start + old_space_strings_.length());
   }
 }
 
@@ -756,18 +713,9 @@ void Heap::ExternalStringTable::ShrinkNewStrings(int position) {
 #endif
 }
 
-void Heap::ClearInstanceofCache() { set_instanceof_cache_function(Smi::kZero); }
-
 Oddball* Heap::ToBoolean(bool condition) {
   return condition ? true_value() : false_value();
 }
-
-
-void Heap::CompletelyClearInstanceofCache() {
-  set_instanceof_cache_map(Smi::kZero);
-  set_instanceof_cache_function(Smi::kZero);
-}
-
 
 uint32_t Heap::HashSeed() {
   uint32_t seed = static_cast<uint32_t>(hash_seed()->value());
@@ -793,12 +741,18 @@ void Heap::SetArgumentsAdaptorDeoptPCOffset(int pc_offset) {
 }
 
 void Heap::SetConstructStubCreateDeoptPCOffset(int pc_offset) {
-  DCHECK(construct_stub_create_deopt_pc_offset() == Smi::kZero);
+  // TODO(tebbi): Remove second half of DCHECK once
+  // FLAG_harmony_restrict_constructor_return is gone.
+  DCHECK(construct_stub_create_deopt_pc_offset() == Smi::kZero ||
+         construct_stub_create_deopt_pc_offset() == Smi::FromInt(pc_offset));
   set_construct_stub_create_deopt_pc_offset(Smi::FromInt(pc_offset));
 }
 
 void Heap::SetConstructStubInvokeDeoptPCOffset(int pc_offset) {
-  DCHECK(construct_stub_invoke_deopt_pc_offset() == Smi::kZero);
+  // TODO(tebbi): Remove second half of DCHECK once
+  // FLAG_harmony_restrict_constructor_return is gone.
+  DCHECK(construct_stub_invoke_deopt_pc_offset() == Smi::kZero ||
+         construct_stub_invoke_deopt_pc_offset() == Smi::FromInt(pc_offset));
   set_construct_stub_invoke_deopt_pc_offset(Smi::FromInt(pc_offset));
 }
 
@@ -850,30 +804,10 @@ AlwaysAllocateScope::AlwaysAllocateScope(Isolate* isolate)
   heap_->always_allocate_scope_count_.Increment(1);
 }
 
-
 AlwaysAllocateScope::~AlwaysAllocateScope() {
   heap_->always_allocate_scope_count_.Decrement(1);
 }
 
-
-void VerifyPointersVisitor::VisitPointers(Object** start, Object** end) {
-  for (Object** current = start; current < end; current++) {
-    if ((*current)->IsHeapObject()) {
-      HeapObject* object = HeapObject::cast(*current);
-      CHECK(object->GetIsolate()->heap()->Contains(object));
-      CHECK(object->map()->IsMap());
-    } else {
-      CHECK((*current)->IsSmi());
-    }
-  }
-}
-
-
-void VerifySmisVisitor::VisitPointers(Object** start, Object** end) {
-  for (Object** current = start; current < end; current++) {
-    CHECK((*current)->IsSmi());
-  }
-}
 }  // namespace internal
 }  // namespace v8
 

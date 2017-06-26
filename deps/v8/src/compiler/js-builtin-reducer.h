@@ -61,6 +61,7 @@ class V8_EXPORT_PRIVATE JSBuiltinReducer final
   Reduction ReduceArrayShift(Node* node);
   Reduction ReduceDateNow(Node* node);
   Reduction ReduceDateGetTime(Node* node);
+  Reduction ReduceFunctionBind(Node* node);
   Reduction ReduceGlobalIsFinite(Node* node);
   Reduction ReduceGlobalIsNaN(Node* node);
   Reduction ReduceMathAbs(Node* node);
@@ -109,6 +110,8 @@ class V8_EXPORT_PRIVATE JSBuiltinReducer final
   Reduction ReduceStringIndexOf(Node* node);
   Reduction ReduceStringIterator(Node* node);
   Reduction ReduceStringIteratorNext(Node* node);
+  Reduction ReduceStringToLowerCaseIntl(Node* node);
+  Reduction ReduceStringToUpperCaseIntl(Node* node);
   Reduction ReduceArrayBufferViewAccessor(Node* node,
                                           InstanceType instance_type,
                                           FieldAccess const& access);

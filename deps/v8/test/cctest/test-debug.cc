@@ -158,11 +158,11 @@ static void SetDebugEventListener(
 }
 
 // Is there any debug info for the function?
-static bool HasDebugInfo(v8::Local<v8::Function> fun) {
+static bool HasBreakInfo(v8::Local<v8::Function> fun) {
   Handle<v8::internal::JSFunction> f =
       Handle<v8::internal::JSFunction>::cast(v8::Utils::OpenHandle(*fun));
   Handle<v8::internal::SharedFunctionInfo> shared(f->shared());
-  return shared->HasDebugInfo();
+  return shared->HasBreakInfo();
 }
 
 // Set a break point in a function with a position relative to function start,
@@ -384,14 +384,13 @@ void CheckDebuggerUnloaded(bool check_functions) {
   CHECK(!CcTest::i_isolate()->debug()->debug_info_list_);
 
   // Collect garbage to ensure weak handles are cleared.
-  CcTest::CollectAllGarbage(i::Heap::kFinalizeIncrementalMarkingMask);
+  CcTest::CollectAllGarbage();
   CcTest::CollectAllGarbage(Heap::kMakeHeapIterableMask);
 
-  // Iterate the head and check that there are no debugger related objects left.
+  // Iterate the heap and check that there are no debugger related objects left.
   HeapIterator iterator(CcTest::heap());
   for (HeapObject* obj = iterator.next(); obj != NULL; obj = iterator.next()) {
     CHECK(!obj->IsDebugInfo());
-    CHECK(!obj->IsBreakPointInfo());
 
     // If deep check of functions is requested check that no debug break code
     // is left in all functions.
@@ -612,6 +611,7 @@ static void DebugEventCounterClear() {
 
 static void DebugEventCounter(
     const v8::Debug::EventDetails& event_details) {
+  v8::Isolate::AllowJavascriptExecutionScope allow_script(CcTest::isolate());
   v8::DebugEvent event = event_details.GetEvent();
   v8::Local<v8::Object> exec_state = event_details.GetExecutionState();
   v8::Local<v8::Object> event_data = event_details.GetEventData();
@@ -813,7 +813,7 @@ static void DebugEventBreakPointCollectGarbage(
       CcTest::CollectGarbage(v8::internal::NEW_SPACE);
     } else {
       // Mark sweep compact.
-      CcTest::CollectAllGarbage(i::Heap::kFinalizeIncrementalMarkingMask);
+      CcTest::CollectAllGarbage();
     }
   }
 }
@@ -907,30 +907,30 @@ TEST(DebugInfo) {
       CompileFunction(&env, "function bar(){}", "bar");
   // Initially no functions are debugged.
   CHECK_EQ(0, v8::internal::GetDebuggedFunctions()->length());
-  CHECK(!HasDebugInfo(foo));
-  CHECK(!HasDebugInfo(bar));
+  CHECK(!HasBreakInfo(foo));
+  CHECK(!HasBreakInfo(bar));
   EnableDebugger(env->GetIsolate());
   // One function (foo) is debugged.
   int bp1 = SetBreakPoint(foo, 0);
   CHECK_EQ(1, v8::internal::GetDebuggedFunctions()->length());
-  CHECK(HasDebugInfo(foo));
-  CHECK(!HasDebugInfo(bar));
+  CHECK(HasBreakInfo(foo));
+  CHECK(!HasBreakInfo(bar));
   // Two functions are debugged.
   int bp2 = SetBreakPoint(bar, 0);
   CHECK_EQ(2, v8::internal::GetDebuggedFunctions()->length());
-  CHECK(HasDebugInfo(foo));
-  CHECK(HasDebugInfo(bar));
+  CHECK(HasBreakInfo(foo));
+  CHECK(HasBreakInfo(bar));
   // One function (bar) is debugged.
   ClearBreakPoint(bp1);
   CHECK_EQ(1, v8::internal::GetDebuggedFunctions()->length());
-  CHECK(!HasDebugInfo(foo));
-  CHECK(HasDebugInfo(bar));
+  CHECK(!HasBreakInfo(foo));
+  CHECK(HasBreakInfo(bar));
   // No functions are debugged.
   ClearBreakPoint(bp2);
   DisableDebugger(env->GetIsolate());
   CHECK_EQ(0, v8::internal::GetDebuggedFunctions()->length());
-  CHECK(!HasDebugInfo(foo));
-  CHECK(!HasDebugInfo(bar));
+  CHECK(!HasBreakInfo(foo));
+  CHECK(!HasBreakInfo(bar));
 }
 
 
@@ -1224,7 +1224,7 @@ static void CallAndGC(v8::Local<v8::Context> context,
     CHECK_EQ(2 + i * 3, break_point_hit_count);
 
     // Mark sweep (and perhaps compact) and call function.
-    CcTest::CollectAllGarbage(i::Heap::kFinalizeIncrementalMarkingMask);
+    CcTest::CollectAllGarbage();
     f->Call(context, recv, 0, NULL).ToLocalChecked();
     CHECK_EQ(3 + i * 3, break_point_hit_count);
   }
@@ -1948,7 +1948,7 @@ TEST(ScriptBreakPointLineTopLevel) {
           ->Get(context, v8_str(env->GetIsolate(), "f"))
           .ToLocalChecked());
 
-  CcTest::CollectAllGarbage(i::Heap::kFinalizeIncrementalMarkingMask);
+  CcTest::CollectAllGarbage();
 
   SetScriptBreakPointByNameFromJS(env->GetIsolate(), "test.html", 3, -1);
 
@@ -6373,6 +6373,7 @@ static void NoInterruptsOnDebugEvent(
   // Do not allow nested AfterCompile events.
   CHECK(after_compile_handler_depth <= 1);
   v8::Isolate* isolate = event_details.GetEventContext()->GetIsolate();
+  v8::Isolate::AllowJavascriptExecutionScope allow_script(isolate);
   isolate->RequestInterrupt(&HandleInterrupt, nullptr);
   CompileRun("function foo() {}; foo();");
   --after_compile_handler_depth;
@@ -6402,7 +6403,7 @@ TEST(BreakLocationIterator) {
   Handle<i::SharedFunctionInfo> shared(function->shared());
 
   EnableDebugger(isolate);
-  CHECK(i_isolate->debug()->EnsureDebugInfo(shared));
+  CHECK(i_isolate->debug()->EnsureBreakInfo(shared));
 
   Handle<i::DebugInfo> debug_info(shared->GetDebugInfo());
   Handle<i::AbstractCode> abstract_code(shared->abstract_code());
@@ -6669,13 +6670,10 @@ TEST(BuiltinsExceptionPrediction) {
     if (i::HandlerTable::cast(builtin->handler_table())->length() == 0)
       continue;
 
-    if (builtin->is_promise_rejection() || builtin->is_exception_caught())
-      continue;
-
     if (whitelist.find(i) != whitelist.end()) continue;
 
-    fail = true;
-    i::PrintF("%s is missing exception predictions.\n", builtins->name(i));
+    auto prediction = builtin->GetBuiltinCatchPrediction();
+    USE(prediction);
   }
   CHECK(!fail);
 }
@@ -6704,12 +6702,38 @@ TEST(DebugGetPossibleBreakpointsReturnLocations) {
       ++returns_count;
     }
   }
-  if (i::FLAG_turbo) {
-    // With turbofan we generate one return location per return statement,
+  if (i::FLAG_ignition) {
+    // With Ignition we generate one return location per return statement,
     // each has line = 5, column = 0 as statement position.
     CHECK(returns_count == 4);
   } else {
-    // Without turbofan we generate one return location.
+    // Without Ignition we generate one return location.
     CHECK(returns_count == 1);
+  }
+}
+
+TEST(DebugEvaluateNoSideEffect) {
+  LocalContext env;
+  i::Isolate* isolate = CcTest::i_isolate();
+  i::HandleScope scope(isolate);
+  i::List<i::Handle<i::JSFunction>> list;
+  {
+    i::HeapIterator iterator(isolate->heap());
+    while (i::HeapObject* obj = iterator.next()) {
+      if (!obj->IsJSFunction()) continue;
+      i::JSFunction* fun = i::JSFunction::cast(obj);
+      list.Add(i::Handle<i::JSFunction>(fun));
+    }
+  }
+
+  // Perform side effect check on all built-in functions. The side effect check
+  // itself contains additional sanity checks.
+  for (i::Handle<i::JSFunction> fun : list) {
+    bool failed = false;
+    {
+      i::NoSideEffectScope scope(isolate, true);
+      failed = !isolate->debug()->PerformSideEffectCheck(fun);
+    }
+    if (failed) isolate->clear_pending_exception();
   }
 }

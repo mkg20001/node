@@ -2,149 +2,167 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/builtins/builtins-string-gen.h"
+
 #include "src/builtins/builtins-regexp-gen.h"
 #include "src/builtins/builtins-utils-gen.h"
 #include "src/builtins/builtins.h"
 #include "src/code-factory.h"
-#include "src/code-stub-assembler.h"
 #include "src/objects.h"
 
 namespace v8 {
 namespace internal {
 
 typedef CodeStubAssembler::RelationalComparisonMode RelationalComparisonMode;
+typedef compiler::Node Node;
 
-class StringBuiltinsAssembler : public CodeStubAssembler {
- public:
-  explicit StringBuiltinsAssembler(compiler::CodeAssemblerState* state)
-      : CodeStubAssembler(state) {}
+Node* StringBuiltinsAssembler::DirectStringData(Node* string,
+                                                Node* string_instance_type) {
+  // Compute the effective offset of the first character.
+  VARIABLE(var_data, MachineType::PointerRepresentation());
+  Label if_sequential(this), if_external(this), if_join(this);
+  Branch(Word32Equal(Word32And(string_instance_type,
+                               Int32Constant(kStringRepresentationMask)),
+                     Int32Constant(kSeqStringTag)),
+         &if_sequential, &if_external);
 
- protected:
-  Node* DirectStringData(Node* string, Node* string_instance_type) {
-    // Compute the effective offset of the first character.
-    VARIABLE(var_data, MachineType::PointerRepresentation());
-    Label if_sequential(this), if_external(this), if_join(this);
-    Branch(Word32Equal(Word32And(string_instance_type,
-                                 Int32Constant(kStringRepresentationMask)),
-                       Int32Constant(kSeqStringTag)),
-           &if_sequential, &if_external);
-
-    BIND(&if_sequential);
-    {
-      var_data.Bind(IntPtrAdd(
-          IntPtrConstant(SeqOneByteString::kHeaderSize - kHeapObjectTag),
-          BitcastTaggedToWord(string)));
-      Goto(&if_join);
-    }
-
-    BIND(&if_external);
-    {
-      // This is only valid for ExternalStrings where the resource data
-      // pointer is cached (i.e. no short external strings).
-      CSA_ASSERT(this, Word32NotEqual(
-                           Word32And(string_instance_type,
-                                     Int32Constant(kShortExternalStringMask)),
-                           Int32Constant(kShortExternalStringTag)));
-      var_data.Bind(LoadObjectField(string, ExternalString::kResourceDataOffset,
-                                    MachineType::Pointer()));
-      Goto(&if_join);
-    }
-
-    BIND(&if_join);
-    return var_data.value();
+  BIND(&if_sequential);
+  {
+    var_data.Bind(IntPtrAdd(
+        IntPtrConstant(SeqOneByteString::kHeaderSize - kHeapObjectTag),
+        BitcastTaggedToWord(string)));
+    Goto(&if_join);
   }
 
-  Node* LoadOneByteChar(Node* string, Node* index) {
-    return Load(MachineType::Uint8(), string, OneByteCharOffset(index));
+  BIND(&if_external);
+  {
+    // This is only valid for ExternalStrings where the resource data
+    // pointer is cached (i.e. no short external strings).
+    CSA_ASSERT(
+        this, Word32NotEqual(Word32And(string_instance_type,
+                                       Int32Constant(kShortExternalStringMask)),
+                             Int32Constant(kShortExternalStringTag)));
+    var_data.Bind(LoadObjectField(string, ExternalString::kResourceDataOffset,
+                                  MachineType::Pointer()));
+    Goto(&if_join);
   }
 
-  Node* OneByteCharAddress(Node* string, Node* index) {
-    Node* offset = OneByteCharOffset(index);
-    return IntPtrAdd(string, offset);
+  BIND(&if_join);
+  return var_data.value();
+}
+
+void StringBuiltinsAssembler::DispatchOnStringEncodings(
+    Node* const lhs_instance_type, Node* const rhs_instance_type,
+    Label* if_one_one, Label* if_one_two, Label* if_two_one,
+    Label* if_two_two) {
+  STATIC_ASSERT(kStringEncodingMask == 0x8);
+  STATIC_ASSERT(kTwoByteStringTag == 0x0);
+  STATIC_ASSERT(kOneByteStringTag == 0x8);
+
+  // First combine the encodings.
+
+  Node* const encoding_mask = Int32Constant(kStringEncodingMask);
+  Node* const lhs_encoding = Word32And(lhs_instance_type, encoding_mask);
+  Node* const rhs_encoding = Word32And(rhs_instance_type, encoding_mask);
+
+  Node* const combined_encodings =
+      Word32Or(lhs_encoding, Word32Shr(rhs_encoding, 1));
+
+  // Then dispatch on the combined encoding.
+
+  Label unreachable(this, Label::kDeferred);
+
+  int32_t values[] = {
+      kOneByteStringTag | (kOneByteStringTag >> 1),
+      kOneByteStringTag | (kTwoByteStringTag >> 1),
+      kTwoByteStringTag | (kOneByteStringTag >> 1),
+      kTwoByteStringTag | (kTwoByteStringTag >> 1),
+  };
+  Label* labels[] = {
+      if_one_one, if_one_two, if_two_one, if_two_two,
+  };
+
+  STATIC_ASSERT(arraysize(values) == arraysize(labels));
+  Switch(combined_encodings, &unreachable, values, labels, arraysize(values));
+
+  BIND(&unreachable);
+  Unreachable();
+}
+
+template <typename SubjectChar, typename PatternChar>
+Node* StringBuiltinsAssembler::CallSearchStringRaw(Node* const subject_ptr,
+                                                   Node* const subject_length,
+                                                   Node* const search_ptr,
+                                                   Node* const search_length,
+                                                   Node* const start_position) {
+  Node* const function_addr = ExternalConstant(
+      ExternalReference::search_string_raw<SubjectChar, PatternChar>(
+          isolate()));
+  Node* const isolate_ptr =
+      ExternalConstant(ExternalReference::isolate_address(isolate()));
+
+  MachineType type_ptr = MachineType::Pointer();
+  MachineType type_intptr = MachineType::IntPtr();
+
+  Node* const result = CallCFunction6(
+      type_intptr, type_ptr, type_ptr, type_intptr, type_ptr, type_intptr,
+      type_intptr, function_addr, isolate_ptr, subject_ptr, subject_length,
+      search_ptr, search_length, start_position);
+
+  return result;
+}
+
+Node* StringBuiltinsAssembler::PointerToStringDataAtIndex(
+    Node* const string_data, Node* const index, String::Encoding encoding) {
+  const ElementsKind kind = (encoding == String::ONE_BYTE_ENCODING)
+                                ? UINT8_ELEMENTS
+                                : UINT16_ELEMENTS;
+  Node* const offset_in_bytes =
+      ElementOffsetFromIndex(index, kind, INTPTR_PARAMETERS);
+  return IntPtrAdd(string_data, offset_in_bytes);
+}
+
+void StringBuiltinsAssembler::ConvertAndBoundsCheckStartArgument(
+    Node* context, Variable* var_start, Node* start, Node* string_length) {
+  Node* const start_int =
+      ToInteger(context, start, CodeStubAssembler::kTruncateMinusZero);
+  Node* const zero = SmiConstant(Smi::kZero);
+
+  Label done(this);
+  Label if_issmi(this), if_isheapnumber(this, Label::kDeferred);
+  Branch(TaggedIsSmi(start_int), &if_issmi, &if_isheapnumber);
+
+  BIND(&if_issmi);
+  {
+    var_start->Bind(
+        Select(SmiLessThan(start_int, zero),
+               [&] { return SmiMax(SmiAdd(string_length, start_int), zero); },
+               [&] { return start_int; }, MachineRepresentation::kTagged));
+    Goto(&done);
   }
 
-  Node* OneByteCharOffset(Node* index) {
-    return CharOffset(String::ONE_BYTE_ENCODING, index);
+  BIND(&if_isheapnumber);
+  {
+    // If {start} is a heap number, it is definitely out of bounds. If it is
+    // negative, {start} = max({string_length} + {start}),0) = 0'. If it is
+    // positive, set {start} to {string_length} which ultimately results in
+    // returning an empty string.
+    Node* const float_zero = Float64Constant(0.);
+    Node* const start_float = LoadHeapNumberValue(start_int);
+    var_start->Bind(SelectTaggedConstant(
+        Float64LessThan(start_float, float_zero), zero, string_length));
+    Goto(&done);
   }
-
-  Node* CharOffset(String::Encoding encoding, Node* index) {
-    const int header = SeqOneByteString::kHeaderSize - kHeapObjectTag;
-    Node* offset = index;
-    if (encoding == String::TWO_BYTE_ENCODING) {
-      offset = IntPtrAdd(offset, offset);
-    }
-    offset = IntPtrAdd(offset, IntPtrConstant(header));
-    return offset;
-  }
-
-  void DispatchOnStringInstanceType(Node* const instance_type,
-                                    Label* if_onebyte_sequential,
-                                    Label* if_onebyte_external,
-                                    Label* if_otherwise) {
-    const int kMask = kStringRepresentationMask | kStringEncodingMask;
-    Node* const encoding_and_representation =
-        Word32And(instance_type, Int32Constant(kMask));
-
-    int32_t values[] = {
-        kOneByteStringTag | kSeqStringTag,
-        kOneByteStringTag | kExternalStringTag,
-    };
-    Label* labels[] = {
-        if_onebyte_sequential, if_onebyte_external,
-    };
-    STATIC_ASSERT(arraysize(values) == arraysize(labels));
-
-    Switch(encoding_and_representation, if_otherwise, values, labels,
-           arraysize(values));
-  }
-
-  void GenerateStringEqual(Node* context, Node* left, Node* right);
-  void GenerateStringRelationalComparison(Node* context, Node* left,
-                                          Node* right,
-                                          RelationalComparisonMode mode);
-
-  Node* ToSmiBetweenZeroAnd(Node* context, Node* value, Node* limit);
-
-  Node* LoadSurrogatePairAt(Node* string, Node* length, Node* index,
-                            UnicodeEncoding encoding);
-
-  void StringIndexOf(Node* receiver, Node* instance_type, Node* search_string,
-                     Node* search_string_instance_type, Node* position,
-                     std::function<void(Node*)> f_return);
-
-  Node* IsNullOrUndefined(Node* const value);
-  void RequireObjectCoercible(Node* const context, Node* const value,
-                              const char* method_name);
-
-  Node* SmiIsNegative(Node* const value) {
-    return SmiLessThan(value, SmiConstant(0));
-  }
-
-  // Implements boilerplate logic for {match, split, replace, search} of the
-  // form:
-  //
-  //  if (!IS_NULL_OR_UNDEFINED(object)) {
-  //    var maybe_function = object[symbol];
-  //    if (!IS_UNDEFINED(maybe_function)) {
-  //      return %_Call(maybe_function, ...);
-  //    }
-  //  }
-  //
-  // Contains fast paths for Smi and RegExp objects.
-  typedef std::function<Node*()> NodeFunction0;
-  typedef std::function<Node*(Node* fn)> NodeFunction1;
-  void MaybeCallFunctionAtSymbol(Node* const context, Node* const object,
-                                 Handle<Symbol> symbol,
-                                 const NodeFunction0& regexp_call,
-                                 const NodeFunction1& generic_call);
-};
+  BIND(&done);
+}
 
 void StringBuiltinsAssembler::GenerateStringEqual(Node* context, Node* left,
                                                   Node* right) {
   // Here's pseudo-code for the algorithm below:
   //
-  // if (lhs == rhs) return true;
   // if (lhs->length() != rhs->length()) return false;
+  // restart:
+  // if (lhs == rhs) return true;
   // if (lhs->IsInternalizedString() && rhs->IsInternalizedString()) {
   //   return false;
   // }
@@ -155,97 +173,33 @@ void StringBuiltinsAssembler::GenerateStringEqual(Node* context, Node* left,
   //   return true;
   // }
   // if (lhs and/or rhs are indirect strings) {
-  //   unwrap them and restart from the beginning;
+  //   unwrap them and restart from the "restart:" label;
   // }
   // return %StringEqual(lhs, rhs);
 
   VARIABLE(var_left, MachineRepresentation::kTagged, left);
   VARIABLE(var_right, MachineRepresentation::kTagged, right);
-
   Variable* input_vars[2] = {&var_left, &var_right};
-  Label if_equal(this), if_notequal(this), restart(this, 2, input_vars);
+  Label if_equal(this), if_notequal(this), if_notbothdirectonebytestrings(this),
+      restart(this, 2, input_vars);
+
+  Node* lhs_length = LoadStringLength(left);
+  Node* rhs_length = LoadStringLength(right);
+
+  // Strings with different lengths cannot be equal.
+  GotoIf(WordNotEqual(lhs_length, rhs_length), &if_notequal);
+
   Goto(&restart);
   BIND(&restart);
   Node* lhs = var_left.value();
   Node* rhs = var_right.value();
 
-  // Fast check to see if {lhs} and {rhs} refer to the same String object.
-  GotoIf(WordEqual(lhs, rhs), &if_equal);
-
-  // Load the length of {lhs} and {rhs}.
-  Node* lhs_length = LoadStringLength(lhs);
-  Node* rhs_length = LoadStringLength(rhs);
-
-  // Strings with different lengths cannot be equal.
-  GotoIf(WordNotEqual(lhs_length, rhs_length), &if_notequal);
-
-  // Load instance types of {lhs} and {rhs}.
   Node* lhs_instance_type = LoadInstanceType(lhs);
   Node* rhs_instance_type = LoadInstanceType(rhs);
 
-  // Combine the instance types into a single 16-bit value, so we can check
-  // both of them at once.
-  Node* both_instance_types = Word32Or(
-      lhs_instance_type, Word32Shl(rhs_instance_type, Int32Constant(8)));
-
-  // Check if both {lhs} and {rhs} are internalized. Since we already know
-  // that they're not the same object, they're not equal in that case.
-  int const kBothInternalizedMask =
-      kIsNotInternalizedMask | (kIsNotInternalizedMask << 8);
-  int const kBothInternalizedTag = kInternalizedTag | (kInternalizedTag << 8);
-  GotoIf(Word32Equal(Word32And(both_instance_types,
-                               Int32Constant(kBothInternalizedMask)),
-                     Int32Constant(kBothInternalizedTag)),
-         &if_notequal);
-
-  // Check that both {lhs} and {rhs} are flat one-byte strings, and that
-  // in case of ExternalStrings the data pointer is cached..
-  STATIC_ASSERT(kShortExternalStringTag != 0);
-  int const kBothDirectOneByteStringMask =
-      kStringEncodingMask | kIsIndirectStringMask | kShortExternalStringMask |
-      ((kStringEncodingMask | kIsIndirectStringMask | kShortExternalStringMask)
-       << 8);
-  int const kBothDirectOneByteStringTag =
-      kOneByteStringTag | (kOneByteStringTag << 8);
-  Label if_bothdirectonebytestrings(this), if_notbothdirectonebytestrings(this);
-  Branch(Word32Equal(Word32And(both_instance_types,
-                               Int32Constant(kBothDirectOneByteStringMask)),
-                     Int32Constant(kBothDirectOneByteStringTag)),
-         &if_bothdirectonebytestrings, &if_notbothdirectonebytestrings);
-
-  BIND(&if_bothdirectonebytestrings);
-  {
-    // Compute the effective offset of the first character.
-    Node* lhs_data = DirectStringData(lhs, lhs_instance_type);
-    Node* rhs_data = DirectStringData(rhs, rhs_instance_type);
-
-    // Compute the first offset after the string from the length.
-    Node* length = SmiUntag(lhs_length);
-
-    // Loop over the {lhs} and {rhs} strings to see if they are equal.
-    VARIABLE(var_offset, MachineType::PointerRepresentation());
-    Label loop(this, &var_offset);
-    var_offset.Bind(IntPtrConstant(0));
-    Goto(&loop);
-    BIND(&loop);
-    {
-      // If {offset} equals {end}, no difference was found, so the
-      // strings are equal.
-      Node* offset = var_offset.value();
-      GotoIf(WordEqual(offset, length), &if_equal);
-
-      // Load the next characters from {lhs} and {rhs}.
-      Node* lhs_value = Load(MachineType::Uint8(), lhs_data, offset);
-      Node* rhs_value = Load(MachineType::Uint8(), rhs_data, offset);
-
-      // Check if the characters match.
-      GotoIf(Word32NotEqual(lhs_value, rhs_value), &if_notequal);
-
-      // Advance to next character.
-      var_offset.Bind(IntPtrAdd(offset, IntPtrConstant(1)));
-      Goto(&loop);
-    }
-  }
+  StringEqual_Core(context, lhs, lhs_instance_type, lhs_length, rhs,
+                   rhs_instance_type, &if_equal, &if_notequal,
+                   &if_notbothdirectonebytestrings);
 
   BIND(&if_notbothdirectonebytestrings);
   {
@@ -262,6 +216,80 @@ void StringBuiltinsAssembler::GenerateStringEqual(Node* context, Node* left,
 
   BIND(&if_notequal);
   Return(FalseConstant());
+}
+
+void StringBuiltinsAssembler::StringEqual_Core(
+    Node* context, Node* lhs, Node* lhs_instance_type, Node* lhs_length,
+    Node* rhs, Node* rhs_instance_type, Label* if_equal, Label* if_not_equal,
+    Label* if_notbothdirectonebyte) {
+  CSA_ASSERT(this, IsString(lhs));
+  CSA_ASSERT(this, IsString(rhs));
+  CSA_ASSERT(this, WordEqual(LoadStringLength(lhs), lhs_length));
+  CSA_ASSERT(this, WordEqual(LoadStringLength(rhs), lhs_length));
+  // Fast check to see if {lhs} and {rhs} refer to the same String object.
+  GotoIf(WordEqual(lhs, rhs), if_equal);
+
+  // Combine the instance types into a single 16-bit value, so we can check
+  // both of them at once.
+  Node* both_instance_types = Word32Or(
+      lhs_instance_type, Word32Shl(rhs_instance_type, Int32Constant(8)));
+
+  // Check if both {lhs} and {rhs} are internalized. Since we already know
+  // that they're not the same object, they're not equal in that case.
+  int const kBothInternalizedMask =
+      kIsNotInternalizedMask | (kIsNotInternalizedMask << 8);
+  int const kBothInternalizedTag = kInternalizedTag | (kInternalizedTag << 8);
+  GotoIf(Word32Equal(Word32And(both_instance_types,
+                               Int32Constant(kBothInternalizedMask)),
+                     Int32Constant(kBothInternalizedTag)),
+         if_not_equal);
+
+  // Check that both {lhs} and {rhs} are flat one-byte strings, and that
+  // in case of ExternalStrings the data pointer is cached..
+  STATIC_ASSERT(kShortExternalStringTag != 0);
+  int const kBothDirectOneByteStringMask =
+      kStringEncodingMask | kIsIndirectStringMask | kShortExternalStringMask |
+      ((kStringEncodingMask | kIsIndirectStringMask | kShortExternalStringMask)
+       << 8);
+  int const kBothDirectOneByteStringTag =
+      kOneByteStringTag | (kOneByteStringTag << 8);
+  GotoIfNot(Word32Equal(Word32And(both_instance_types,
+                                  Int32Constant(kBothDirectOneByteStringMask)),
+                        Int32Constant(kBothDirectOneByteStringTag)),
+            if_notbothdirectonebyte);
+
+  // At this point we know that we have two direct one-byte strings.
+
+  // Compute the effective offset of the first character.
+  Node* lhs_data = DirectStringData(lhs, lhs_instance_type);
+  Node* rhs_data = DirectStringData(rhs, rhs_instance_type);
+
+  // Compute the first offset after the string from the length.
+  Node* length = SmiUntag(lhs_length);
+
+  // Loop over the {lhs} and {rhs} strings to see if they are equal.
+  VARIABLE(var_offset, MachineType::PointerRepresentation());
+  Label loop(this, &var_offset);
+  var_offset.Bind(IntPtrConstant(0));
+  Goto(&loop);
+  BIND(&loop);
+  {
+    // If {offset} equals {end}, no difference was found, so the
+    // strings are equal.
+    Node* offset = var_offset.value();
+    GotoIf(WordEqual(offset, length), if_equal);
+
+    // Load the next characters from {lhs} and {rhs}.
+    Node* lhs_value = Load(MachineType::Uint8(), lhs_data, offset);
+    Node* rhs_value = Load(MachineType::Uint8(), rhs_data, offset);
+
+    // Check if the characters match.
+    GotoIf(Word32NotEqual(lhs_value, rhs_value), if_not_equal);
+
+    // Advance to next character.
+    var_offset.Bind(IntPtrAdd(offset, IntPtrConstant(1)));
+    Goto(&loop);
+  }
 }
 
 void StringBuiltinsAssembler::GenerateStringRelationalComparison(
@@ -697,7 +725,7 @@ TF_BUILTIN(StringPrototypeConcat, CodeStubAssembler) {
   arguments.ForEach(
       CodeStubAssembler::VariableList({&var_result}, zone()),
       [this, context, &var_result](Node* arg) {
-        arg = CallStub(CodeFactory::ToString(isolate()), context, arg);
+        arg = ToString_Inline(context, arg);
         var_result.Bind(CallStub(CodeFactory::StringAdd(isolate()), context,
                                  var_result.value(), arg));
       });
@@ -705,103 +733,148 @@ TF_BUILTIN(StringPrototypeConcat, CodeStubAssembler) {
 }
 
 void StringBuiltinsAssembler::StringIndexOf(
-    Node* receiver, Node* instance_type, Node* search_string,
-    Node* search_string_instance_type, Node* position,
-    std::function<void(Node*)> f_return) {
-  CSA_ASSERT(this, IsString(receiver));
+    Node* const subject_string, Node* const subject_instance_type,
+    Node* const search_string, Node* const search_instance_type,
+    Node* const position, std::function<void(Node*)> f_return) {
+  CSA_ASSERT(this, IsString(subject_string));
   CSA_ASSERT(this, IsString(search_string));
   CSA_ASSERT(this, TaggedIsSmi(position));
 
-  Label zero_length_needle(this),
-      call_runtime_unchecked(this, Label::kDeferred), return_minus_1(this),
-      check_search_string(this), continue_fast_path(this);
-
   Node* const int_zero = IntPtrConstant(0);
+
   VARIABLE(var_needle_byte, MachineType::PointerRepresentation(), int_zero);
   VARIABLE(var_string_addr, MachineType::PointerRepresentation(), int_zero);
 
-  Node* needle_length = SmiUntag(LoadStringLength(search_string));
-  // Use faster/complex runtime fallback for long search strings.
-  GotoIf(IntPtrLessThan(IntPtrConstant(1), needle_length),
-         &call_runtime_unchecked);
-  Node* string_length = SmiUntag(LoadStringLength(receiver));
-  Node* start_position = IntPtrMax(SmiUntag(position), int_zero);
+  Node* const search_length = SmiUntag(LoadStringLength(search_string));
+  Node* const subject_length = SmiUntag(LoadStringLength(subject_string));
+  Node* const start_position = IntPtrMax(SmiUntag(position), int_zero);
 
-  GotoIf(IntPtrEqual(int_zero, needle_length), &zero_length_needle);
-  // Check that the needle fits in the start position.
-  GotoIfNot(IntPtrLessThanOrEqual(needle_length,
-                                  IntPtrSub(string_length, start_position)),
-            &return_minus_1);
-
-  // Load the string address.
+  Label zero_length_needle(this), return_minus_1(this);
   {
-    Label if_onebyte_sequential(this);
-    Label if_onebyte_external(this, Label::kDeferred);
+    GotoIf(IntPtrEqual(int_zero, search_length), &zero_length_needle);
 
-    // Only support one-byte strings on the fast path.
-    DispatchOnStringInstanceType(instance_type, &if_onebyte_sequential,
-                                 &if_onebyte_external, &call_runtime_unchecked);
+    // Check that the needle fits in the start position.
+    GotoIfNot(IntPtrLessThanOrEqual(search_length,
+                                    IntPtrSub(subject_length, start_position)),
+              &return_minus_1);
+  }
 
-    BIND(&if_onebyte_sequential);
+  // Try to unpack subject and search strings. Bail to runtime if either needs
+  // to be flattened.
+  ToDirectStringAssembler subject_to_direct(state(), subject_string);
+  ToDirectStringAssembler search_to_direct(state(), search_string);
+
+  Label call_runtime_unchecked(this, Label::kDeferred);
+
+  subject_to_direct.TryToDirect(&call_runtime_unchecked);
+  search_to_direct.TryToDirect(&call_runtime_unchecked);
+
+  // Load pointers to string data.
+  Node* const subject_ptr =
+      subject_to_direct.PointerToData(&call_runtime_unchecked);
+  Node* const search_ptr =
+      search_to_direct.PointerToData(&call_runtime_unchecked);
+
+  Node* const subject_offset = subject_to_direct.offset();
+  Node* const search_offset = search_to_direct.offset();
+
+  // Like String::IndexOf, the actual matching is done by the optimized
+  // SearchString method in string-search.h. Dispatch based on string instance
+  // types, then call straight into C++ for matching.
+
+  CSA_ASSERT(this, IntPtrGreaterThan(search_length, int_zero));
+  CSA_ASSERT(this, IntPtrGreaterThanOrEqual(start_position, int_zero));
+  CSA_ASSERT(this, IntPtrGreaterThanOrEqual(subject_length, start_position));
+  CSA_ASSERT(this,
+             IntPtrLessThanOrEqual(search_length,
+                                   IntPtrSub(subject_length, start_position)));
+
+  Label one_one(this), one_two(this), two_one(this), two_two(this);
+  DispatchOnStringEncodings(subject_to_direct.instance_type(),
+                            search_to_direct.instance_type(), &one_one,
+                            &one_two, &two_one, &two_two);
+
+  typedef const uint8_t onebyte_t;
+  typedef const uc16 twobyte_t;
+
+  BIND(&one_one);
+  {
+    Node* const adjusted_subject_ptr = PointerToStringDataAtIndex(
+        subject_ptr, subject_offset, String::ONE_BYTE_ENCODING);
+    Node* const adjusted_search_ptr = PointerToStringDataAtIndex(
+        search_ptr, search_offset, String::ONE_BYTE_ENCODING);
+
+    Label direct_memchr_call(this), generic_fast_path(this);
+    Branch(IntPtrEqual(search_length, IntPtrConstant(1)), &direct_memchr_call,
+           &generic_fast_path);
+
+    // An additional fast path that calls directly into memchr for 1-length
+    // search strings.
+    BIND(&direct_memchr_call);
     {
-      var_string_addr.Bind(
-          OneByteCharAddress(BitcastTaggedToWord(receiver), start_position));
-      Goto(&check_search_string);
+      Node* const string_addr = IntPtrAdd(adjusted_subject_ptr, start_position);
+      Node* const search_length = IntPtrSub(subject_length, start_position);
+      Node* const search_byte =
+          ChangeInt32ToIntPtr(Load(MachineType::Uint8(), adjusted_search_ptr));
+
+      Node* const memchr =
+          ExternalConstant(ExternalReference::libc_memchr_function(isolate()));
+      Node* const result_address =
+          CallCFunction3(MachineType::Pointer(), MachineType::Pointer(),
+                         MachineType::IntPtr(), MachineType::UintPtr(), memchr,
+                         string_addr, search_byte, search_length);
+      GotoIf(WordEqual(result_address, int_zero), &return_minus_1);
+      Node* const result_index =
+          IntPtrAdd(IntPtrSub(result_address, string_addr), start_position);
+      f_return(SmiTag(result_index));
     }
 
-    BIND(&if_onebyte_external);
+    BIND(&generic_fast_path);
     {
-      Node* const unpacked = TryDerefExternalString(receiver, instance_type,
-                                                    &call_runtime_unchecked);
-      var_string_addr.Bind(OneByteCharAddress(unpacked, start_position));
-      Goto(&check_search_string);
+      Node* const result = CallSearchStringRaw<onebyte_t, onebyte_t>(
+          adjusted_subject_ptr, subject_length, adjusted_search_ptr,
+          search_length, start_position);
+      f_return(SmiTag(result));
     }
   }
 
-  // Load the needle character.
-  BIND(&check_search_string);
+  BIND(&one_two);
   {
-    Label if_onebyte_sequential(this);
-    Label if_onebyte_external(this, Label::kDeferred);
+    Node* const adjusted_subject_ptr = PointerToStringDataAtIndex(
+        subject_ptr, subject_offset, String::ONE_BYTE_ENCODING);
+    Node* const adjusted_search_ptr = PointerToStringDataAtIndex(
+        search_ptr, search_offset, String::TWO_BYTE_ENCODING);
 
-    DispatchOnStringInstanceType(search_string_instance_type,
-                                 &if_onebyte_sequential, &if_onebyte_external,
-                                 &call_runtime_unchecked);
-
-    BIND(&if_onebyte_sequential);
-    {
-      var_needle_byte.Bind(
-          ChangeInt32ToIntPtr(LoadOneByteChar(search_string, int_zero)));
-      Goto(&continue_fast_path);
-    }
-
-    BIND(&if_onebyte_external);
-    {
-      Node* const unpacked = TryDerefExternalString(
-          search_string, search_string_instance_type, &call_runtime_unchecked);
-      var_needle_byte.Bind(
-          ChangeInt32ToIntPtr(LoadOneByteChar(unpacked, int_zero)));
-      Goto(&continue_fast_path);
-    }
+    Node* const result = CallSearchStringRaw<onebyte_t, twobyte_t>(
+        adjusted_subject_ptr, subject_length, adjusted_search_ptr,
+        search_length, start_position);
+    f_return(SmiTag(result));
   }
 
-  BIND(&continue_fast_path);
+  BIND(&two_one);
   {
-    Node* needle_byte = var_needle_byte.value();
-    Node* string_addr = var_string_addr.value();
-    Node* search_length = IntPtrSub(string_length, start_position);
-    // Call out to the highly optimized memchr to perform the actual byte
-    // search.
-    Node* memchr =
-        ExternalConstant(ExternalReference::libc_memchr_function(isolate()));
-    Node* result_address =
-        CallCFunction3(MachineType::Pointer(), MachineType::Pointer(),
-                       MachineType::IntPtr(), MachineType::UintPtr(), memchr,
-                       string_addr, needle_byte, search_length);
-    GotoIf(WordEqual(result_address, int_zero), &return_minus_1);
-    Node* result_index =
-        IntPtrAdd(IntPtrSub(result_address, string_addr), start_position);
-    f_return(SmiTag(result_index));
+    Node* const adjusted_subject_ptr = PointerToStringDataAtIndex(
+        subject_ptr, subject_offset, String::TWO_BYTE_ENCODING);
+    Node* const adjusted_search_ptr = PointerToStringDataAtIndex(
+        search_ptr, search_offset, String::ONE_BYTE_ENCODING);
+
+    Node* const result = CallSearchStringRaw<twobyte_t, onebyte_t>(
+        adjusted_subject_ptr, subject_length, adjusted_search_ptr,
+        search_length, start_position);
+    f_return(SmiTag(result));
+  }
+
+  BIND(&two_two);
+  {
+    Node* const adjusted_subject_ptr = PointerToStringDataAtIndex(
+        subject_ptr, subject_offset, String::TWO_BYTE_ENCODING);
+    Node* const adjusted_search_ptr = PointerToStringDataAtIndex(
+        search_ptr, search_offset, String::TWO_BYTE_ENCODING);
+
+    Node* const result = CallSearchStringRaw<twobyte_t, twobyte_t>(
+        adjusted_subject_ptr, subject_length, adjusted_search_ptr,
+        search_length, start_position);
+    f_return(SmiTag(result));
   }
 
   BIND(&return_minus_1);
@@ -810,7 +883,7 @@ void StringBuiltinsAssembler::StringIndexOf(
   BIND(&zero_length_needle);
   {
     Comment("0-length search_string");
-    f_return(SmiTag(IntPtrMin(string_length, start_position)));
+    f_return(SmiTag(IntPtrMin(subject_length, start_position)));
   }
 
   BIND(&call_runtime_unchecked);
@@ -819,7 +892,7 @@ void StringBuiltinsAssembler::StringIndexOf(
     // are already known due to type checks in this stub.
     Comment("Call Runtime Unchecked");
     Node* result = CallRuntime(Runtime::kStringIndexOfUnchecked, SmiConstant(0),
-                               receiver, search_string, position);
+                               subject_string, search_string, position);
     f_return(result);
   }
 }
@@ -933,7 +1006,8 @@ void StringBuiltinsAssembler::RequireObjectCoercible(Node* const context,
 
 void StringBuiltinsAssembler::MaybeCallFunctionAtSymbol(
     Node* const context, Node* const object, Handle<Symbol> symbol,
-    const NodeFunction0& regexp_call, const NodeFunction1& generic_call) {
+    const NodeFunction0& regexp_call, const NodeFunction1& generic_call,
+    CodeStubArguments* args) {
   Label out(this);
 
   // Smis definitely don't have an attached symbol.
@@ -971,7 +1045,12 @@ void StringBuiltinsAssembler::MaybeCallFunctionAtSymbol(
                                   &slow_lookup);
 
     BIND(&stub_call);
-    Return(regexp_call());
+    Node* const result = regexp_call();
+    if (args == nullptr) {
+      Return(result);
+    } else {
+      args->PopAndReturn(result);
+    }
 
     BIND(&slow_lookup);
   }
@@ -979,16 +1058,80 @@ void StringBuiltinsAssembler::MaybeCallFunctionAtSymbol(
   GotoIf(IsNullOrUndefined(object), &out);
 
   // Fall back to a slow lookup of {object[symbol]}.
+  //
+  // The spec uses GetMethod({object}, {symbol}), which has a few quirks:
+  // * null values are turned into undefined, and
+  // * an exception is thrown if the value is not undefined, null, or callable.
+  // We handle the former by jumping to {out} for null values as well, while
+  // the latter is already handled by the Call({maybe_func}) operation.
 
   Node* const maybe_func = GetProperty(context, object, symbol);
   GotoIf(IsUndefined(maybe_func), &out);
+  GotoIf(IsNull(maybe_func), &out);
 
   // Attempt to call the function.
-
   Node* const result = generic_call(maybe_func);
-  Return(result);
+  if (args == nullptr) {
+    Return(result);
+  } else {
+    args->PopAndReturn(result);
+  }
 
   BIND(&out);
+}
+
+compiler::Node* StringBuiltinsAssembler::IndexOfDollarChar(Node* const context,
+                                                           Node* const string) {
+  CSA_ASSERT(this, IsString(string));
+
+  Node* const dollar_string = HeapConstant(
+      isolate()->factory()->LookupSingleCharacterStringFromCode('$'));
+  Node* const dollar_ix = CallBuiltin(Builtins::kStringIndexOf, context, string,
+                                      dollar_string, SmiConstant(0));
+
+  CSA_ASSERT(this, TaggedIsSmi(dollar_ix));
+  return dollar_ix;
+}
+
+compiler::Node* StringBuiltinsAssembler::GetSubstitution(
+    Node* context, Node* subject_string, Node* match_start_index,
+    Node* match_end_index, Node* replace_string) {
+  CSA_ASSERT(this, IsString(subject_string));
+  CSA_ASSERT(this, IsString(replace_string));
+  CSA_ASSERT(this, TaggedIsPositiveSmi(match_start_index));
+  CSA_ASSERT(this, TaggedIsPositiveSmi(match_end_index));
+
+  VARIABLE(var_result, MachineRepresentation::kTagged, replace_string);
+  Label runtime(this), out(this);
+
+  // In this primitive implementation we simply look for the next '$' char in
+  // {replace_string}. If it doesn't exist, we can simply return
+  // {replace_string} itself. If it does, then we delegate to
+  // String::GetSubstitution, passing in the index of the first '$' to avoid
+  // repeated scanning work.
+  // TODO(jgruber): Possibly extend this in the future to handle more complex
+  // cases without runtime calls.
+
+  Node* const dollar_index = IndexOfDollarChar(context, replace_string);
+  Branch(SmiIsNegative(dollar_index), &out, &runtime);
+
+  BIND(&runtime);
+  {
+    CSA_ASSERT(this, TaggedIsPositiveSmi(dollar_index));
+
+    Callable substring_callable = CodeFactory::SubString(isolate());
+    Node* const matched = CallStub(substring_callable, context, subject_string,
+                                   match_start_index, match_end_index);
+    Node* const replacement_string =
+        CallRuntime(Runtime::kGetSubstitution, context, matched, subject_string,
+                    match_start_index, replace_string, dollar_index);
+    var_result.Bind(replacement_string);
+
+    Goto(&out);
+  }
+
+  BIND(&out);
+  return var_result.value();
 }
 
 // ES6 #sec-string.prototype.replace
@@ -1009,13 +1152,10 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
   MaybeCallFunctionAtSymbol(
       context, search, isolate()->factory()->replace_symbol(),
       [=]() {
-        Callable tostring_callable = CodeFactory::ToString(isolate());
-        Node* const subject_string =
-            CallStub(tostring_callable, context, receiver);
+        Node* const subject_string = ToString_Inline(context, receiver);
 
-        Callable replace_callable = CodeFactory::RegExpReplace(isolate());
-        return CallStub(replace_callable, context, search, subject_string,
-                        replace);
+        return CallBuiltin(Builtins::kRegExpReplace, context, search,
+                           subject_string, replace);
       },
       [=](Node* fn) {
         Callable call_callable = CodeFactory::Call(isolate());
@@ -1024,16 +1164,13 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
 
   // Convert {receiver} and {search} to strings.
 
-  Callable tostring_callable = CodeFactory::ToString(isolate());
-  Callable indexof_callable = CodeFactory::StringIndexOf(isolate());
-
-  Node* const subject_string = CallStub(tostring_callable, context, receiver);
-  Node* const search_string = CallStub(tostring_callable, context, search);
+  Node* const subject_string = ToString_Inline(context, receiver);
+  Node* const search_string = ToString_Inline(context, search);
 
   Node* const subject_length = LoadStringLength(subject_string);
   Node* const search_length = LoadStringLength(search_string);
 
-  // Fast-path single-char {search}, long {receiver}, and simple string
+  // Fast-path single-char {search}, long cons {receiver}, and simple string
   // {replace}.
   {
     Label next(this);
@@ -1043,11 +1180,10 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
     GotoIf(TaggedIsSmi(replace), &next);
     GotoIfNot(IsString(replace), &next);
 
-    Node* const dollar_string = HeapConstant(
-        isolate()->factory()->LookupSingleCharacterStringFromCode('$'));
-    Node* const dollar_ix =
-        CallStub(indexof_callable, context, replace, dollar_string, smi_zero);
-    GotoIfNot(SmiIsNegative(dollar_ix), &next);
+    Node* const subject_instance_type = LoadInstanceType(subject_string);
+    GotoIfNot(IsConsStringInstanceType(subject_instance_type), &next);
+
+    GotoIf(TaggedIsPositiveSmi(IndexOfDollarChar(context, replace)), &next);
 
     // Searching by traversing a cons string tree and replace with cons of
     // slices works only when the replaced string is a single character, being
@@ -1064,8 +1200,9 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
   // longer substrings - we can handle up to 8 chars (one-byte) / 4 chars
   // (2-byte).
 
-  Node* const match_start_index = CallStub(
-      indexof_callable, context, subject_string, search_string, smi_zero);
+  Node* const match_start_index =
+      CallBuiltin(Builtins::kStringIndexOf, context, subject_string,
+                  search_string, smi_zero);
   CSA_ASSERT(this, TaggedIsSmi(match_start_index));
 
   // Early exit if no match found.
@@ -1083,7 +1220,7 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
 
     // TODO(jgruber): Could introduce ToStringSideeffectsStub which only
     // performs observable parts of ToString.
-    CallStub(tostring_callable, context, replace);
+    ToString_Inline(context, replace);
     Goto(&return_subject);
 
     BIND(&return_subject);
@@ -1126,8 +1263,7 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
     Node* const replacement =
         CallJS(call_callable, context, replace, UndefinedConstant(),
                search_string, match_start_index, subject_string);
-    Node* const replacement_string =
-        CallStub(tostring_callable, context, replacement);
+    Node* const replacement_string = ToString_Inline(context, replacement);
     var_result.Bind(CallStub(stringadd_callable, context, var_result.value(),
                              replacement_string));
     Goto(&out);
@@ -1135,16 +1271,12 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
 
   BIND(&if_notcallablereplace);
   {
-    Node* const replace_string = CallStub(tostring_callable, context, replace);
-
-    // TODO(jgruber): Simplified GetSubstitution implementation in CSA.
-    Node* const matched = CallStub(substring_callable, context, subject_string,
-                                   match_start_index, match_end_index);
-    Node* const replacement_string =
-        CallRuntime(Runtime::kGetSubstitution, context, matched, subject_string,
-                    match_start_index, replace_string);
-    var_result.Bind(CallStub(stringadd_callable, context, var_result.value(),
-                             replacement_string));
+    Node* const replace_string = ToString_Inline(context, replace);
+    Node* const replacement =
+        GetSubstitution(context, subject_string, match_start_index,
+                        match_end_index, replace_string);
+    var_result.Bind(
+        CallStub(stringadd_callable, context, var_result.value(), replacement));
     Goto(&out);
   }
 
@@ -1158,14 +1290,101 @@ TF_BUILTIN(StringPrototypeReplace, StringBuiltinsAssembler) {
   }
 }
 
+// ES6 section 21.1.3.18 String.prototype.slice ( start, end )
+TF_BUILTIN(StringPrototypeSlice, StringBuiltinsAssembler) {
+  Label out(this);
+  VARIABLE(var_start, MachineRepresentation::kTagged);
+  VARIABLE(var_end, MachineRepresentation::kTagged);
+
+  const int kStart = 0;
+  const int kEnd = 1;
+  Node* argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+  Node* const receiver = args.GetReceiver();
+  Node* const start = args.GetOptionalArgumentValue(kStart);
+  Node* const end = args.GetOptionalArgumentValue(kEnd);
+  Node* const context = Parameter(BuiltinDescriptor::kContext);
+
+  Node* const smi_zero = SmiConstant(0);
+
+  // 1. Let O be ? RequireObjectCoercible(this value).
+  RequireObjectCoercible(context, receiver, "String.prototype.slice");
+
+  // 2. Let S be ? ToString(O).
+  Node* const subject_string =
+      CallBuiltin(Builtins::kToString, context, receiver);
+
+  // 3. Let len be the number of elements in S.
+  Node* const length = LoadStringLength(subject_string);
+
+  // Conversions and bounds-checks for {start}.
+  ConvertAndBoundsCheckStartArgument(context, &var_start, start, length);
+
+  // 5. If end is undefined, let intEnd be len;
+  var_end.Bind(length);
+  GotoIf(WordEqual(end, UndefinedConstant()), &out);
+
+  // else let intEnd be ? ToInteger(end).
+  Node* const end_int =
+      ToInteger(context, end, CodeStubAssembler::kTruncateMinusZero);
+
+  // 7. If intEnd < 0, let to be max(len + intEnd, 0);
+  //    otherwise let to be min(intEnd, len).
+  Label if_issmi(this), if_isheapnumber(this, Label::kDeferred);
+  Branch(TaggedIsSmi(end_int), &if_issmi, &if_isheapnumber);
+
+  BIND(&if_issmi);
+  {
+    Node* const length_plus_end = SmiAdd(length, end_int);
+    var_end.Bind(Select(SmiLessThan(end_int, smi_zero),
+                        [&] { return SmiMax(length_plus_end, smi_zero); },
+                        [&] { return SmiMin(length, end_int); },
+                        MachineRepresentation::kTagged));
+    Goto(&out);
+  }
+
+  BIND(&if_isheapnumber);
+  {
+    // If {end} is a heap number, it is definitely out of bounds. If it is
+    // negative, {int_end} = max({length} + {int_end}),0) = 0'. If it is
+    // positive, set {int_end} to {length} which ultimately results in
+    // returning an empty string.
+    Node* const float_zero = Float64Constant(0.);
+    Node* const end_float = LoadHeapNumberValue(end_int);
+    var_end.Bind(SelectTaggedConstant(Float64LessThan(end_float, float_zero),
+                                      smi_zero, length));
+    Goto(&out);
+  }
+
+  Label return_emptystring(this);
+  BIND(&out);
+  {
+    GotoIf(SmiLessThanOrEqual(var_end.value(), var_start.value()),
+           &return_emptystring);
+    Node* const result =
+        SubString(context, subject_string, var_start.value(), var_end.value(),
+                  SubStringFlags::FROM_TO_ARE_BOUNDED);
+    args.PopAndReturn(result);
+  }
+
+  BIND(&return_emptystring);
+  args.PopAndReturn(EmptyStringConstant());
+}
+
 // ES6 section 21.1.3.19 String.prototype.split ( separator, limit )
 TF_BUILTIN(StringPrototypeSplit, StringBuiltinsAssembler) {
-  Label out(this);
+  const int kSeparatorArg = 0;
+  const int kLimitArg = 1;
 
-  Node* const receiver = Parameter(Descriptor::kReceiver);
-  Node* const separator = Parameter(Descriptor::kSeparator);
-  Node* const limit = Parameter(Descriptor::kLimit);
-  Node* const context = Parameter(Descriptor::kContext);
+  Node* const argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+
+  Node* const receiver = args.GetReceiver();
+  Node* const separator = args.GetOptionalArgumentValue(kSeparatorArg);
+  Node* const limit = args.GetOptionalArgumentValue(kLimitArg);
+  Node* const context = Parameter(BuiltinDescriptor::kContext);
 
   Node* const smi_zero = SmiConstant(0);
 
@@ -1176,29 +1395,25 @@ TF_BUILTIN(StringPrototypeSplit, StringBuiltinsAssembler) {
   MaybeCallFunctionAtSymbol(
       context, separator, isolate()->factory()->split_symbol(),
       [=]() {
-        Callable tostring_callable = CodeFactory::ToString(isolate());
-        Node* const subject_string =
-            CallStub(tostring_callable, context, receiver);
+        Node* const subject_string = ToString_Inline(context, receiver);
 
-        Callable split_callable = CodeFactory::RegExpSplit(isolate());
-        return CallStub(split_callable, context, separator, subject_string,
-                        limit);
+        return CallBuiltin(Builtins::kRegExpSplit, context, separator,
+                           subject_string, limit);
       },
       [=](Node* fn) {
         Callable call_callable = CodeFactory::Call(isolate());
         return CallJS(call_callable, context, fn, separator, receiver, limit);
-      });
+      },
+      &args);
 
   // String and integer conversions.
 
-  Callable tostring_callable = CodeFactory::ToString(isolate());
-  Node* const subject_string = CallStub(tostring_callable, context, receiver);
+  Node* const subject_string = ToString_Inline(context, receiver);
   Node* const limit_number =
       Select(IsUndefined(limit), [=]() { return NumberConstant(kMaxUInt32); },
              [=]() { return ToUint32(context, limit); },
              MachineRepresentation::kTagged);
-  Node* const separator_string =
-      CallStub(tostring_callable, context, separator);
+  Node* const separator_string = ToString_Inline(context, separator);
 
   // Shortcut for {limit} == 0.
   {
@@ -1213,7 +1428,7 @@ TF_BUILTIN(StringPrototypeSplit, StringBuiltinsAssembler) {
     Node* const capacity = IntPtrConstant(0);
     Node* const result = AllocateJSArray(kind, array_map, capacity, length);
 
-    Return(result);
+    args.PopAndReturn(result);
 
     BIND(&next);
   }
@@ -1235,7 +1450,7 @@ TF_BUILTIN(StringPrototypeSplit, StringBuiltinsAssembler) {
     Node* const fixed_array = LoadElements(result);
     StoreFixedArrayElement(fixed_array, 0, subject_string);
 
-    Return(result);
+    args.PopAndReturn(result);
 
     BIND(&next);
   }
@@ -1247,7 +1462,7 @@ TF_BUILTIN(StringPrototypeSplit, StringBuiltinsAssembler) {
 
     Node* const result = CallRuntime(Runtime::kStringToArray, context,
                                      subject_string, limit_number);
-    Return(result);
+    args.PopAndReturn(result);
 
     BIND(&next);
   }
@@ -1255,20 +1470,27 @@ TF_BUILTIN(StringPrototypeSplit, StringBuiltinsAssembler) {
   Node* const result =
       CallRuntime(Runtime::kStringSplit, context, subject_string,
                   separator_string, limit_number);
-  Return(result);
+  args.PopAndReturn(result);
 }
 
 // ES6 #sec-string.prototype.substr
-TF_BUILTIN(StringPrototypeSubstr, CodeStubAssembler) {
-  Label out(this), handle_length(this);
+TF_BUILTIN(StringPrototypeSubstr, StringBuiltinsAssembler) {
+  const int kStartArg = 0;
+  const int kLengthArg = 1;
+
+  Node* const argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+
+  Node* const receiver = args.GetReceiver();
+  Node* const start = args.GetOptionalArgumentValue(kStartArg);
+  Node* const length = args.GetOptionalArgumentValue(kLengthArg);
+  Node* const context = Parameter(BuiltinDescriptor::kContext);
+
+  Label out(this);
 
   VARIABLE(var_start, MachineRepresentation::kTagged);
   VARIABLE(var_length, MachineRepresentation::kTagged);
-
-  Node* const receiver = Parameter(Descriptor::kReceiver);
-  Node* const start = Parameter(Descriptor::kStart);
-  Node* const length = Parameter(Descriptor::kLength);
-  Node* const context = Parameter(Descriptor::kContext);
 
   Node* const zero = SmiConstant(Smi::kZero);
 
@@ -1279,94 +1501,62 @@ TF_BUILTIN(StringPrototypeSubstr, CodeStubAssembler) {
   Node* const string_length = LoadStringLength(string);
 
   // Conversions and bounds-checks for {start}.
-  {
-    Node* const start_int =
-        ToInteger(context, start, CodeStubAssembler::kTruncateMinusZero);
-
-    Label if_issmi(this), if_isheapnumber(this, Label::kDeferred);
-    Branch(TaggedIsSmi(start_int), &if_issmi, &if_isheapnumber);
-
-    BIND(&if_issmi);
-    {
-      Node* const length_plus_start = SmiAdd(string_length, start_int);
-      var_start.Bind(Select(SmiLessThan(start_int, zero),
-                            [&] { return SmiMax(length_plus_start, zero); },
-                            [&] { return start_int; },
-                            MachineRepresentation::kTagged));
-      Goto(&handle_length);
-    }
-
-    BIND(&if_isheapnumber);
-    {
-      // If {start} is a heap number, it is definitely out of bounds. If it is
-      // negative, {start} = max({string_length} + {start}),0) = 0'. If it is
-      // positive, set {start} to {string_length} which ultimately results in
-      // returning an empty string.
-      Node* const float_zero = Float64Constant(0.);
-      Node* const start_float = LoadHeapNumberValue(start_int);
-      var_start.Bind(SelectTaggedConstant(
-          Float64LessThan(start_float, float_zero), zero, string_length));
-      Goto(&handle_length);
-    }
-  }
+  ConvertAndBoundsCheckStartArgument(context, &var_start, start, string_length);
 
   // Conversions and bounds-checks for {length}.
-  BIND(&handle_length);
+  Label if_issmi(this), if_isheapnumber(this, Label::kDeferred);
+
+  // Default to {string_length} if {length} is undefined.
   {
-    Label if_issmi(this), if_isheapnumber(this, Label::kDeferred);
+    Label if_isundefined(this, Label::kDeferred), if_isnotundefined(this);
+    Branch(WordEqual(length, UndefinedConstant()), &if_isundefined,
+           &if_isnotundefined);
 
-    // Default to {string_length} if {length} is undefined.
+    BIND(&if_isundefined);
+    var_length.Bind(string_length);
+    Goto(&if_issmi);
+
+    BIND(&if_isnotundefined);
+    var_length.Bind(
+        ToInteger(context, length, CodeStubAssembler::kTruncateMinusZero));
+  }
+
+  Branch(TaggedIsSmi(var_length.value()), &if_issmi, &if_isheapnumber);
+
+  // Set {length} to min(max({length}, 0), {string_length} - {start}
+  BIND(&if_issmi);
+  {
+    Node* const positive_length = SmiMax(var_length.value(), zero);
+
+    Node* const minimal_length = SmiSub(string_length, var_start.value());
+    var_length.Bind(SmiMin(positive_length, minimal_length));
+
+    GotoIfNot(SmiLessThanOrEqual(var_length.value(), zero), &out);
+    args.PopAndReturn(EmptyStringConstant());
+  }
+
+  BIND(&if_isheapnumber);
+  {
+    // If {length} is a heap number, it is definitely out of bounds. There are
+    // two cases according to the spec: if it is negative, "" is returned; if
+    // it is positive, then length is set to {string_length} - {start}.
+
+    CSA_ASSERT(this, IsHeapNumber(var_length.value()));
+
+    Label if_isnegative(this), if_ispositive(this);
+    Node* const float_zero = Float64Constant(0.);
+    Node* const length_float = LoadHeapNumberValue(var_length.value());
+    Branch(Float64LessThan(length_float, float_zero), &if_isnegative,
+           &if_ispositive);
+
+    BIND(&if_isnegative);
+    args.PopAndReturn(EmptyStringConstant());
+
+    BIND(&if_ispositive);
     {
-      Label if_isundefined(this, Label::kDeferred), if_isnotundefined(this);
-      Branch(WordEqual(length, UndefinedConstant()), &if_isundefined,
-             &if_isnotundefined);
-
-      BIND(&if_isundefined);
-      var_length.Bind(string_length);
-      Goto(&if_issmi);
-
-      BIND(&if_isnotundefined);
-      var_length.Bind(
-          ToInteger(context, length, CodeStubAssembler::kTruncateMinusZero));
-    }
-
-    Branch(TaggedIsSmi(var_length.value()), &if_issmi, &if_isheapnumber);
-
-    // Set {length} to min(max({length}, 0), {string_length} - {start}
-    BIND(&if_issmi);
-    {
-      Node* const positive_length = SmiMax(var_length.value(), zero);
-
-      Node* const minimal_length = SmiSub(string_length, var_start.value());
-      var_length.Bind(SmiMin(positive_length, minimal_length));
-
+      var_length.Bind(SmiSub(string_length, var_start.value()));
       GotoIfNot(SmiLessThanOrEqual(var_length.value(), zero), &out);
-      Return(EmptyStringConstant());
-    }
-
-    BIND(&if_isheapnumber);
-    {
-      // If {length} is a heap number, it is definitely out of bounds. There are
-      // two cases according to the spec: if it is negative, "" is returned; if
-      // it is positive, then length is set to {string_length} - {start}.
-
-      CSA_ASSERT(this, IsHeapNumberMap(LoadMap(var_length.value())));
-
-      Label if_isnegative(this), if_ispositive(this);
-      Node* const float_zero = Float64Constant(0.);
-      Node* const length_float = LoadHeapNumberValue(var_length.value());
-      Branch(Float64LessThan(length_float, float_zero), &if_isnegative,
-             &if_ispositive);
-
-      BIND(&if_isnegative);
-      Return(EmptyStringConstant());
-
-      BIND(&if_ispositive);
-      {
-        var_length.Bind(SmiSub(string_length, var_start.value()));
-        GotoIfNot(SmiLessThanOrEqual(var_length.value(), zero), &out);
-        Return(EmptyStringConstant());
-      }
+      args.PopAndReturn(EmptyStringConstant());
     }
   }
 
@@ -1374,7 +1564,7 @@ TF_BUILTIN(StringPrototypeSubstr, CodeStubAssembler) {
   {
     Node* const end = SmiAdd(var_start.value(), var_length.value());
     Node* const result = SubString(context, string, var_start.value(), end);
-    Return(result);
+    args.PopAndReturn(result);
   }
 }
 
@@ -1413,7 +1603,7 @@ compiler::Node* StringBuiltinsAssembler::ToSmiBetweenZeroAnd(Node* context,
   BIND(&if_isnotsmi);
   {
     // {value} is a heap number - in this case, it is definitely out of bounds.
-    CSA_ASSERT(this, IsHeapNumberMap(LoadMap(value_int)));
+    CSA_ASSERT(this, IsHeapNumber(value_int));
 
     Node* const float_zero = Float64Constant(0.);
     Node* const smi_zero = SmiConstant(Smi::kZero);
@@ -1429,15 +1619,22 @@ compiler::Node* StringBuiltinsAssembler::ToSmiBetweenZeroAnd(Node* context,
 
 // ES6 #sec-string.prototype.substring
 TF_BUILTIN(StringPrototypeSubstring, StringBuiltinsAssembler) {
+  const int kStartArg = 0;
+  const int kEndArg = 1;
+
+  Node* const argc =
+      ChangeInt32ToIntPtr(Parameter(BuiltinDescriptor::kArgumentsCount));
+  CodeStubArguments args(this, argc);
+
+  Node* const receiver = args.GetReceiver();
+  Node* const start = args.GetOptionalArgumentValue(kStartArg);
+  Node* const end = args.GetOptionalArgumentValue(kEndArg);
+  Node* const context = Parameter(BuiltinDescriptor::kContext);
+
   Label out(this);
 
   VARIABLE(var_start, MachineRepresentation::kTagged);
   VARIABLE(var_end, MachineRepresentation::kTagged);
-
-  Node* const receiver = Parameter(Descriptor::kReceiver);
-  Node* const start = Parameter(Descriptor::kStart);
-  Node* const end = Parameter(Descriptor::kEnd);
-  Node* const context = Parameter(Descriptor::kContext);
 
   // Check that {receiver} is coercible to Object and convert it to a String.
   Node* const string =
@@ -1472,7 +1669,7 @@ TF_BUILTIN(StringPrototypeSubstring, StringBuiltinsAssembler) {
   {
     Node* result =
         SubString(context, string, var_start.value(), var_end.value());
-    Return(result);
+    args.PopAndReturn(result);
   }
 }
 
@@ -1650,6 +1847,259 @@ TF_BUILTIN(StringIteratorPrototypeNext, StringBuiltinsAssembler) {
                 iterator);
     Unreachable();
   }
+}
+
+Node* StringBuiltinsAssembler::ConcatenateSequentialStrings(
+    Node* context, Node* first_arg_ptr, Node* last_arg_ptr, Node* total_length,
+    String::Encoding encoding) {
+  Node* result;
+  if (encoding == String::ONE_BYTE_ENCODING) {
+    result = AllocateSeqOneByteString(context, total_length, SMI_PARAMETERS);
+  } else {
+    DCHECK_EQ(String::TWO_BYTE_ENCODING, encoding);
+    result = AllocateSeqTwoByteString(context, total_length, SMI_PARAMETERS);
+  }
+
+  VARIABLE(current_arg, MachineType::PointerRepresentation(), first_arg_ptr);
+  VARIABLE(str_index, MachineRepresentation::kTaggedSigned,
+           SmiConstant(Smi::kZero));
+
+  Label loop(this, {&current_arg, &str_index}), done(this);
+
+  Goto(&loop);
+  BIND(&loop);
+  {
+    VARIABLE(current_string, MachineRepresentation::kTagged,
+             Load(MachineType::AnyTagged(), current_arg.value()));
+
+    Label deref_indirect(this, Label::kDeferred),
+        is_sequential(this, &current_string);
+
+    // Check if we need to dereference an indirect string.
+    Node* instance_type = LoadInstanceType(current_string.value());
+    Branch(IsSequentialStringInstanceType(instance_type), &is_sequential,
+           &deref_indirect);
+
+    BIND(&is_sequential);
+    {
+      Node* current_length = LoadStringLength(current_string.value());
+      CopyStringCharacters(current_string.value(), result,
+                           SmiConstant(Smi::kZero), str_index.value(),
+                           current_length, encoding, encoding, SMI_PARAMETERS);
+      str_index.Bind(SmiAdd(str_index.value(), current_length));
+      current_arg.Bind(
+          IntPtrSub(current_arg.value(), IntPtrConstant(kPointerSize)));
+      Branch(IntPtrGreaterThanOrEqual(current_arg.value(), last_arg_ptr), &loop,
+             &done);
+    }
+
+    BIND(&deref_indirect);
+    {
+      DerefIndirectString(&current_string, instance_type);
+      Goto(&is_sequential);
+    }
+  }
+  BIND(&done);
+  CSA_ASSERT(this, SmiEqual(str_index.value(), total_length));
+  return result;
+}
+
+Node* StringBuiltinsAssembler::ConcatenateStrings(Node* context,
+                                                  Node* first_arg_ptr,
+                                                  Node* arg_count,
+                                                  Label* bailout_to_runtime) {
+  Label do_flat_string(this), do_cons_string(this), done(this);
+  // There must be at least two strings being concatenated.
+  CSA_ASSERT(this, Uint32GreaterThanOrEqual(arg_count, Int32Constant(2)));
+  // Arguments grow up on the stack, so subtract arg_count - 1 from first_arg to
+  // get the last argument to be concatenated.
+  Node* last_arg_ptr = IntPtrSub(
+      first_arg_ptr, TimesPointerSize(IntPtrSub(ChangeUint32ToWord(arg_count),
+                                                IntPtrConstant(1))));
+
+  VARIABLE(current_arg, MachineType::PointerRepresentation(), first_arg_ptr);
+  VARIABLE(current_string, MachineRepresentation::kTagged,
+           Load(MachineType::AnyTagged(), current_arg.value()));
+  VARIABLE(total_length, MachineRepresentation::kTaggedSigned,
+           SmiConstant(Smi::kZero));
+  VARIABLE(result, MachineRepresentation::kTagged);
+
+  Node* string_encoding = Word32And(LoadInstanceType(current_string.value()),
+                                    Int32Constant(kStringEncodingMask));
+
+  Label flat_length_loop(this, {&current_arg, &current_string, &total_length}),
+      done_flat_length_loop(this);
+  Goto(&flat_length_loop);
+  BIND(&flat_length_loop);
+  {
+    Comment("Loop to find length and type of initial flat-string");
+    Label is_sequential_or_can_deref(this);
+
+    // Increment total_length by the current string's length.
+    Node* string_length = LoadStringLength(current_string.value());
+    CSA_ASSERT(this, TaggedIsSmi(string_length));
+    // No need to check for Smi overflow since String::kMaxLength is 2^28 - 16.
+    total_length.Bind(SmiAdd(total_length.value(), string_length));
+
+    // If we are above the min cons string length, bailout.
+    GotoIf(SmiAboveOrEqual(total_length.value(),
+                           SmiConstant(ConsString::kMinLength)),
+           &done_flat_length_loop);
+
+    // Check that all the strings have the same encoding type. If we got here
+    // we are still under ConsString::kMinLength so need to bailout to the
+    // runtime if the strings have different encodings.
+    Node* instance_type = LoadInstanceType(current_string.value());
+    GotoIf(Word32NotEqual(
+               string_encoding,
+               Word32And(instance_type, Int32Constant(kStringEncodingMask))),
+           bailout_to_runtime);
+
+    // Check if the new string is sequential or can be dereferenced as a
+    // sequential string. If it can't and we've reached here, we are still under
+    // ConsString::kMinLength so need to bailout to the runtime.
+    GotoIf(IsSequentialStringInstanceType(instance_type),
+           &is_sequential_or_can_deref);
+    BranchIfCanDerefIndirectString(current_string.value(), instance_type,
+                                   &is_sequential_or_can_deref,
+                                   bailout_to_runtime);
+    BIND(&is_sequential_or_can_deref);
+
+    current_arg.Bind(
+        IntPtrSub(current_arg.value(), IntPtrConstant(kPointerSize)));
+    GotoIf(IntPtrLessThan(current_arg.value(), last_arg_ptr),
+           &done_flat_length_loop);
+    current_string.Bind(Load(MachineType::AnyTagged(), current_arg.value()));
+    Goto(&flat_length_loop);
+  }
+  BIND(&done_flat_length_loop);
+
+  // If new length is greater than String::kMaxLength, goto runtime to throw.
+  GotoIf(SmiAboveOrEqual(total_length.value(), SmiConstant(String::kMaxLength)),
+         bailout_to_runtime);
+
+  // If new length is less than ConsString::kMinLength, concatenate all operands
+  // as a flat string.
+  GotoIf(SmiLessThan(total_length.value(), SmiConstant(ConsString::kMinLength)),
+         &do_flat_string);
+
+  // If the new length is is greater than ConsString::kMinLength, create a flat
+  // string for first_arg to current_arg if there is at least two strings
+  // between.
+  {
+    Comment("New length is greater than ConsString::kMinLength");
+
+    // Subtract length of the last string that pushed us over the edge.
+    Node* string_length = LoadStringLength(current_string.value());
+    total_length.Bind(SmiSub(total_length.value(), string_length));
+
+    // If we have 2 or more operands under ConsString::kMinLength, concatenate
+    // them as a flat string before concatenating the rest as a cons string. We
+    // concatenate the initial string as a flat string even though we will end
+    // up with a cons string since the time and memory overheads of that initial
+    // flat string will be less than they would be for concatenating the whole
+    // string as cons strings.
+    GotoIf(
+        IntPtrGreaterThanOrEqual(IntPtrSub(first_arg_ptr, current_arg.value()),
+                                 IntPtrConstant(2 * kPointerSize)),
+        &do_flat_string);
+
+    // Otherwise the whole concatenation should be cons strings.
+    result.Bind(Load(MachineType::AnyTagged(), first_arg_ptr));
+    total_length.Bind(LoadStringLength(result.value()));
+    current_arg.Bind(IntPtrSub(first_arg_ptr, IntPtrConstant(kPointerSize)));
+    Goto(&do_cons_string);
+  }
+
+  BIND(&do_flat_string);
+  {
+    Comment("Flat string concatenation");
+    Node* last_flat_arg_ptr =
+        IntPtrAdd(current_arg.value(), IntPtrConstant(kPointerSize));
+    Label two_byte(this);
+    GotoIf(Word32Equal(string_encoding, Int32Constant(kTwoByteStringTag)),
+           &two_byte);
+
+    {
+      Comment("One-byte sequential string case");
+      result.Bind(ConcatenateSequentialStrings(
+          context, first_arg_ptr, last_flat_arg_ptr, total_length.value(),
+          String::ONE_BYTE_ENCODING));
+      // If there is still more arguments to concatenate, jump to the cons
+      // string case, otherwise we are done.
+      Branch(IntPtrLessThan(current_arg.value(), last_arg_ptr), &done,
+             &do_cons_string);
+    }
+
+    BIND(&two_byte);
+    {
+      Comment("Two-byte sequential string case");
+      result.Bind(ConcatenateSequentialStrings(
+          context, first_arg_ptr, last_flat_arg_ptr, total_length.value(),
+          String::TWO_BYTE_ENCODING));
+      // If there is still more arguments to concatenate, jump to the cons
+      // string case, otherwise we are done.
+      Branch(IntPtrLessThan(current_arg.value(), last_arg_ptr), &done,
+             &do_cons_string);
+    }
+  }
+
+  BIND(&do_cons_string);
+  {
+    Comment("Create cons string");
+    Label loop(this, {&current_arg, &total_length, &result}), done_cons(this);
+
+    Goto(&loop);
+    BIND(&loop);
+    {
+      Node* current_string =
+          Load(MachineType::AnyTagged(), current_arg.value());
+      Node* string_length = LoadStringLength(current_string);
+
+      // Skip concatenating empty string.
+      GotoIf(SmiEqual(string_length, SmiConstant(Smi::kZero)), &done_cons);
+
+      total_length.Bind(SmiAdd(total_length.value(), string_length));
+
+      // If new length is greater than String::kMaxLength, goto runtime to
+      // throw. Note: we also need to invalidate the string length protector, so
+      // can't just throw here directly.
+      GotoIf(SmiAboveOrEqual(total_length.value(),
+                             SmiConstant(String::kMaxLength)),
+             bailout_to_runtime);
+
+      result.Bind(NewConsString(context, total_length.value(), result.value(),
+                                current_string, CodeStubAssembler::kNone));
+      Goto(&done_cons);
+
+      BIND(&done_cons);
+      current_arg.Bind(
+          IntPtrSub(current_arg.value(), IntPtrConstant(kPointerSize)));
+      Branch(IntPtrLessThan(current_arg.value(), last_arg_ptr), &done, &loop);
+    }
+  }
+
+  BIND(&done);
+  IncrementCounter(isolate()->counters()->string_add_native(), 1);
+  return result.value();
+}
+
+TF_BUILTIN(StringConcat, StringBuiltinsAssembler) {
+  Node* argc = Parameter(Descriptor::kArgumentsCount);
+  Node* context = Parameter(Descriptor::kContext);
+
+  CodeStubArguments args(this, ChangeInt32ToIntPtr(argc),
+                         CodeStubArguments::ReceiverMode::kNoReceiver);
+  Node* first_arg_ptr =
+      args.AtIndexPtr(IntPtrConstant(0), ParameterMode::INTPTR_PARAMETERS);
+
+  Label call_runtime(this, Label::kDeferred);
+  Node* result =
+      ConcatenateStrings(context, first_arg_ptr, argc, &call_runtime);
+  args.PopAndReturn(result);
+
+  BIND(&call_runtime);
+  TailCallRuntimeN(Runtime::kStringConcat, context, argc);
 }
 
 }  // namespace internal

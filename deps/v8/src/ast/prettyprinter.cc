@@ -256,6 +256,8 @@ void CallPrinter::VisitAssignment(Assignment* node) {
 
 void CallPrinter::VisitSuspend(Suspend* node) { Find(node->expression()); }
 
+void CallPrinter::VisitYieldStar(YieldStar* node) { Find(node->expression()); }
+
 void CallPrinter::VisitThrow(Throw* node) { Find(node->exception()); }
 
 
@@ -515,7 +517,12 @@ void AstPrinter::PrintLabels(ZoneList<const AstRawString*>* labels) {
   }
 }
 
-void AstPrinter::PrintLiteral(Handle<Object> value, bool quote) {
+void AstPrinter::PrintLiteral(MaybeHandle<Object> maybe_value, bool quote) {
+  Handle<Object> value;
+  if (!maybe_value.ToHandle(&value)) {
+    Print("<nil>");
+    return;
+  }
   Object* object = *value;
   if (object->IsString()) {
     String* string = String::cast(object);
@@ -617,13 +624,12 @@ void AstPrinter::PrintIndented(const char* txt) {
   Print("%s", txt);
 }
 
-
 void AstPrinter::PrintLiteralIndented(const char* info,
-                                      Handle<Object> value,
+                                      MaybeHandle<Object> maybe_value,
                                       bool quote) {
   PrintIndented(info);
   Print(" ");
-  PrintLiteral(value, quote);
+  PrintLiteral(maybe_value, quote);
   Print("\n");
 }
 
@@ -1115,6 +1121,12 @@ void AstPrinter::VisitSuspend(Suspend* node) {
   Visit(node->expression());
 }
 
+void AstPrinter::VisitYieldStar(YieldStar* node) {
+  EmbeddedVector<char, 128> buf;
+  SNPrintF(buf, "YIELD_STAR id %d", node->suspend_id());
+  IndentedScope indent(this, buf.start(), node->position());
+  Visit(node->expression());
+}
 
 void AstPrinter::VisitThrow(Throw* node) {
   IndentedScope indent(this, "THROW", node->position());

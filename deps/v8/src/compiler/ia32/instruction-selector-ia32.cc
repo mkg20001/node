@@ -212,6 +212,14 @@ void VisitFloatUnop(InstructionSelector* selector, Node* node, Node* input,
 
 }  // namespace
 
+void InstructionSelector::VisitStackSlot(Node* node) {
+  StackSlotRepresentation rep = StackSlotRepresentationOf(node->op());
+  int slot = frame_->AllocateSpillSlot(rep.size());
+  OperandGenerator g(this);
+
+  Emit(kArchStackSlot, g.DefineAsRegister(node),
+       sequence()->AddImmediate(Constant(slot)), 0, nullptr);
+}
 
 void InstructionSelector::VisitLoad(Node* node) {
   LoadRepresentation load_rep = LoadRepresentationOf(node->op());
@@ -239,9 +247,6 @@ void InstructionSelector::VisitLoad(Node* node) {
       break;
     case MachineRepresentation::kWord64:   // Fall through.
     case MachineRepresentation::kSimd128:  // Fall through.
-    case MachineRepresentation::kSimd1x4:  // Fall through.
-    case MachineRepresentation::kSimd1x8:  // Fall through.
-    case MachineRepresentation::kSimd1x16:  // Fall through.
     case MachineRepresentation::kNone:
       UNREACHABLE();
       return;
@@ -332,9 +337,6 @@ void InstructionSelector::VisitStore(Node* node) {
         break;
       case MachineRepresentation::kWord64:   // Fall through.
       case MachineRepresentation::kSimd128:  // Fall through.
-      case MachineRepresentation::kSimd1x4:  // Fall through.
-      case MachineRepresentation::kSimd1x8:  // Fall through.
-      case MachineRepresentation::kSimd1x16:  // Fall through.
       case MachineRepresentation::kNone:
         UNREACHABLE();
         return;
@@ -402,9 +404,6 @@ void InstructionSelector::VisitCheckedLoad(Node* node) {
     case MachineRepresentation::kTagged:         // Fall through.
     case MachineRepresentation::kWord64:         // Fall through.
     case MachineRepresentation::kSimd128:        // Fall through.
-    case MachineRepresentation::kSimd1x4:        // Fall through.
-    case MachineRepresentation::kSimd1x8:        // Fall through.
-    case MachineRepresentation::kSimd1x16:       // Fall through.
     case MachineRepresentation::kNone:
       UNREACHABLE();
       return;
@@ -478,9 +477,6 @@ void InstructionSelector::VisitCheckedStore(Node* node) {
     case MachineRepresentation::kTagged:         // Fall through.
     case MachineRepresentation::kWord64:         // Fall through.
     case MachineRepresentation::kSimd128:        // Fall through.
-    case MachineRepresentation::kSimd1x4:        // Fall through.
-    case MachineRepresentation::kSimd1x8:        // Fall through.
-    case MachineRepresentation::kSimd1x16:       // Fall through.
     case MachineRepresentation::kNone:
       UNREACHABLE();
       return;
@@ -1864,11 +1860,7 @@ void InstructionSelector::VisitAtomicBinaryOperation(
   AddressingMode addressing_mode;
   InstructionOperand inputs[3];
   size_t input_count = 0;
-  if (type == MachineType::Int8() || type == MachineType::Uint8()) {
-    inputs[input_count++] = g.UseByteRegister(value);
-  } else {
-    inputs[input_count++] = g.UseUniqueRegister(value);
-  }
+  inputs[input_count++] = g.UseUniqueRegister(value);
   inputs[input_count++] = g.UseUniqueRegister(base);
   if (g.CanBeImmediate(index)) {
     inputs[input_count++] = g.UseImmediate(index);
@@ -1879,7 +1871,11 @@ void InstructionSelector::VisitAtomicBinaryOperation(
   }
   outputs[0] = g.DefineAsFixed(node, eax);
   InstructionOperand temp[1];
-  temp[0] = g.TempRegister();
+  if (type == MachineType::Int8() || type == MachineType::Uint8()) {
+    temp[0] = g.UseByteRegister(node);
+  } else {
+    temp[0] = g.TempRegister();
+  }
   InstructionCode code = opcode | AddressingModeField::encode(addressing_mode);
   Emit(code, 1, outputs, input_count, inputs, 1, temp);
 }
@@ -1910,10 +1906,16 @@ void InstructionSelector::VisitI32x4ExtractLane(Node* node) {
 
 void InstructionSelector::VisitI32x4ReplaceLane(Node* node) {
   IA32OperandGenerator g(this);
-  int32_t lane = OpParameter<int32_t>(node);
-  Emit(kIA32I32x4ReplaceLane, g.DefineSameAsFirst(node),
-       g.UseRegister(node->InputAt(0)), g.UseImmediate(lane),
-       g.Use(node->InputAt(1)));
+  InstructionOperand operand0 = g.UseRegister(node->InputAt(0));
+  InstructionOperand operand1 = g.UseImmediate(OpParameter<int32_t>(node));
+  InstructionOperand operand2 = g.Use(node->InputAt(1));
+  if (IsSupported(AVX)) {
+    Emit(kAVXI32x4ReplaceLane, g.DefineAsRegister(node), operand0, operand1,
+         operand2);
+  } else {
+    Emit(kSSEI32x4ReplaceLane, g.DefineSameAsFirst(node), operand0, operand1,
+         operand2);
+  }
 }
 
 void InstructionSelector::VisitInt32AbsWithOverflow(Node* node) {

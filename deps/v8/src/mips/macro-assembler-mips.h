@@ -180,21 +180,22 @@ class MacroAssembler: public Assembler {
 #define COND_ARGS Condition cond = al, Register rs = zero_reg, \
   const Operand& rt = Operand(zero_reg), BranchDelaySlot bd = PROTECT
 
-  void Jump(Register target, COND_ARGS);
+  void Jump(Register target, int16_t offset = 0, COND_ARGS);
+  void Jump(Register target, Register base, int16_t offset = 0, COND_ARGS);
+  void Jump(Register target, const Operand& offset, COND_ARGS);
   void Jump(intptr_t target, RelocInfo::Mode rmode, COND_ARGS);
   void Jump(Address target, RelocInfo::Mode rmode, COND_ARGS);
   void Jump(Handle<Code> code, RelocInfo::Mode rmode, COND_ARGS);
-  static int CallSize(Register target, COND_ARGS);
-  void Call(Register target, COND_ARGS);
+  static int CallSize(Register target, int16_t offset = 0, COND_ARGS);
+  void Call(Register target, int16_t offset = 0, COND_ARGS);
+  void Call(Register target, Register base, int16_t offset = 0, COND_ARGS);
   static int CallSize(Address target, RelocInfo::Mode rmode, COND_ARGS);
   void Call(Address target, RelocInfo::Mode rmode, COND_ARGS);
   int CallSize(Handle<Code> code,
                RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
-               TypeFeedbackId ast_id = TypeFeedbackId::None(),
                COND_ARGS);
   void Call(Handle<Code> code,
             RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
-            TypeFeedbackId ast_id = TypeFeedbackId::None(),
             COND_ARGS);
   void Ret(COND_ARGS);
   inline void Ret(BranchDelaySlot bd, Condition cond = al,
@@ -910,6 +911,12 @@ class MacroAssembler: public Assembler {
     BranchF64(bd, target, nan, cc, cmp1, cmp2);
   }
 
+  void BranchMSA(Label* target, MSABranchDF df, MSABranchCondition cond,
+                 MSARegister wt, BranchDelaySlot bd = PROTECT);
+
+  void BranchShortMSA(MSABranchDF df, Label* target, MSABranchCondition cond,
+                      MSARegister wt, BranchDelaySlot bd = PROTECT);
+
   // Truncates a double using a specific rounding mode, and writes the value
   // to the result register.
   // The except_flag will contain any exceptions caused by the instruction.
@@ -1298,7 +1305,6 @@ const Operand& rt = Operand(zero_reg), BranchDelaySlot bd = PROTECT
 
   // Call a code stub.
   void CallStub(CodeStub* stub,
-                TypeFeedbackId ast_id = TypeFeedbackId::None(),
                 COND_ARGS);
 
   // Tail call a code stub (jump).
@@ -1529,6 +1535,9 @@ const Operand& rt = Operand(zero_reg), BranchDelaySlot bd = PROTECT
   void AssertNotSmi(Register object);
   void AssertSmi(Register object);
 
+  // Abort execution if argument is not a FixedArray, enabled via --debug-code.
+  void AssertFixedArray(Register object);
+
   // Abort execution if argument is not a JSFunction, enabled via --debug-code.
   void AssertFunction(Register object);
 
@@ -1664,9 +1673,8 @@ const Operand& rt = Operand(zero_reg), BranchDelaySlot bd = PROTECT
   bool IsDoubleZeroRegSet() { return has_double_zero_reg_set_; }
 
  private:
-  void CallCFunctionHelper(Register function,
-                           int num_reg_arguments,
-                           int num_double_arguments);
+  void CallCFunctionHelper(Register function_base, int16_t function_offset,
+                           int num_reg_arguments, int num_double_arguments);
 
   inline Register GetRtAsRegisterHelper(const Operand& rt, Register scratch);
   inline int32_t GetOffset(int32_t offset, Label* L, OffsetSize bits);

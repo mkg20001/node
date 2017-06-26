@@ -5,8 +5,10 @@
 #ifndef V8_COMPILER_CODE_GENERATOR_H_
 #define V8_COMPILER_CODE_GENERATOR_H_
 
+#include "src/base/optional.h"
 #include "src/compiler/gap-resolver.h"
 #include "src/compiler/instruction.h"
+#include "src/compiler/osr.h"
 #include "src/compiler/unwinding-info-writer.h"
 #include "src/deoptimizer.h"
 #include "src/macro-assembler.h"
@@ -48,15 +50,44 @@ class InstructionOperandIterator {
   size_t pos_;
 };
 
+// Either a non-null Handle<Object> or a double.
+class DeoptimizationLiteral {
+ public:
+  DeoptimizationLiteral() : object_(), number_(0) {}
+  explicit DeoptimizationLiteral(Handle<Object> object)
+      : object_(object), number_(0) {
+    DCHECK(!object_.is_null());
+  }
+  explicit DeoptimizationLiteral(double number) : object_(), number_(number) {}
+
+  Handle<Object> object() const { return object_; }
+
+  bool operator==(const DeoptimizationLiteral& other) const {
+    return object_.equals(other.object_) &&
+           bit_cast<uint64_t>(number_) == bit_cast<uint64_t>(other.number_);
+  }
+
+  Handle<Object> Reify(Isolate* isolate) const {
+    return object_.is_null() ? isolate->factory()->NewNumber(number_) : object_;
+  }
+
+ private:
+  Handle<Object> object_;
+  double number_;
+};
 
 // Generates native code for a sequence of instructions.
 class CodeGenerator final : public GapResolver::Assembler {
  public:
   explicit CodeGenerator(Frame* frame, Linkage* linkage,
-                         InstructionSequence* code, CompilationInfo* info);
+                         InstructionSequence* code, CompilationInfo* info,
+                         base::Optional<OsrHelper> osr_helper);
 
-  // Generate native code.
-  Handle<Code> GenerateCode();
+  // Generate native code. After calling AssembleCode, call FinalizeCode to
+  // produce the actual code object. If an error occurs during either phase,
+  // FinalizeCode returns a null handle.
+  void AssembleCode();
+  Handle<Code> FinalizeCode();
 
   InstructionSequence* code() const { return code_; }
   FrameAccessState* frame_access_state() const { return frame_access_state_; }
@@ -80,6 +111,7 @@ class CodeGenerator final : public GapResolver::Assembler {
   SafepointTableBuilder* safepoints() { return &safepoints_; }
   Zone* zone() const { return code()->zone(); }
   CompilationInfo* info() const { return info_; }
+  OsrHelper* osr_helper() { return &(*osr_helper_); }
 
   // Create the FrameAccessState object. The Frame is immutable from here on.
   void CreateFrameAccessState(Frame* frame);
@@ -208,7 +240,7 @@ class CodeGenerator final : public GapResolver::Assembler {
 
   void RecordCallPosition(Instruction* instr);
   void PopulateDeoptimizationData(Handle<Code> code);
-  int DefineDeoptimizationLiteral(Handle<Object> literal);
+  int DefineDeoptimizationLiteral(DeoptimizationLiteral literal);
   DeoptimizationEntry const& GetDeoptimizationEntry(Instruction* instr,
                                                     size_t frame_state_offset);
   DeoptimizeKind GetDeoptimizationKind(int deoptimization_id) const;
@@ -283,15 +315,17 @@ class CodeGenerator final : public GapResolver::Assembler {
   ZoneVector<HandlerInfo> handlers_;
   ZoneDeque<DeoptimizationExit*> deoptimization_exits_;
   ZoneDeque<DeoptimizationState*> deoptimization_states_;
-  ZoneDeque<Handle<Object>> deoptimization_literals_;
+  ZoneDeque<DeoptimizationLiteral> deoptimization_literals_;
   size_t inlined_function_count_;
   TranslationBuffer translations_;
   int last_lazy_deopt_pc_;
   JumpTable* jump_tables_;
   OutOfLineCode* ools_;
+  base::Optional<OsrHelper> osr_helper_;
   int osr_pc_offset_;
   int optimized_out_literal_id_;
   SourcePositionTableBuilder source_position_table_builder_;
+  CodeGenResult result_;
 };
 
 }  // namespace compiler

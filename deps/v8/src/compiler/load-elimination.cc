@@ -195,13 +195,23 @@ void LoadElimination::AbstractChecks::Print() const {
   }
 }
 
-Node* LoadElimination::AbstractElements::Lookup(Node* object,
-                                                Node* index) const {
+namespace {
+
+bool IsCompatible(MachineRepresentation r1, MachineRepresentation r2) {
+  if (r1 == r2) return true;
+  return IsAnyTagged(r1) && IsAnyTagged(r2);
+}
+
+}  // namespace
+
+Node* LoadElimination::AbstractElements::Lookup(
+    Node* object, Node* index, MachineRepresentation representation) const {
   for (Element const element : elements_) {
     if (element.object == nullptr) continue;
     DCHECK_NOT_NULL(element.index);
     DCHECK_NOT_NULL(element.value);
-    if (MustAlias(object, element.object) && MustAlias(index, element.index)) {
+    if (MustAlias(object, element.object) && MustAlias(index, element.index) &&
+        IsCompatible(representation, element.representation)) {
       return element.value;
     }
   }
@@ -470,22 +480,26 @@ LoadElimination::AbstractState const* LoadElimination::AbstractState::KillMaps(
   return this;
 }
 
-Node* LoadElimination::AbstractState::LookupElement(Node* object,
-                                                    Node* index) const {
+Node* LoadElimination::AbstractState::LookupElement(
+    Node* object, Node* index, MachineRepresentation representation) const {
   if (this->elements_) {
-    return this->elements_->Lookup(object, index);
+    return this->elements_->Lookup(object, index, representation);
   }
   return nullptr;
 }
 
 LoadElimination::AbstractState const*
 LoadElimination::AbstractState::AddElement(Node* object, Node* index,
-                                           Node* value, Zone* zone) const {
+                                           Node* value,
+                                           MachineRepresentation representation,
+                                           Zone* zone) const {
   AbstractState* that = new (zone) AbstractState(*this);
   if (that->elements_) {
-    that->elements_ = that->elements_->Extend(object, index, value, zone);
+    that->elements_ =
+        that->elements_->Extend(object, index, value, representation, zone);
   } else {
-    that->elements_ = new (zone) AbstractElements(object, index, value, zone);
+    that->elements_ =
+        new (zone) AbstractElements(object, index, value, representation, zone);
   }
   return that;
 }
@@ -805,9 +819,6 @@ Reduction LoadElimination::ReduceLoadElement(Node* node) {
   ElementAccess const& access = ElementAccessOf(node->op());
   switch (access.machine_type.representation()) {
     case MachineRepresentation::kNone:
-    case MachineRepresentation::kSimd1x4:
-    case MachineRepresentation::kSimd1x8:
-    case MachineRepresentation::kSimd1x16:
     case MachineRepresentation::kBit:
       UNREACHABLE();
       break;
@@ -823,7 +834,8 @@ Reduction LoadElimination::ReduceLoadElement(Node* node) {
     case MachineRepresentation::kTaggedSigned:
     case MachineRepresentation::kTaggedPointer:
     case MachineRepresentation::kTagged:
-      if (Node* replacement = state->LookupElement(object, index)) {
+      if (Node* replacement = state->LookupElement(
+              object, index, access.machine_type.representation())) {
         // Make sure we don't resurrect dead {replacement} nodes.
         if (!replacement->IsDead()) {
           // We might need to guard the {replacement} if the type of the
@@ -838,7 +850,8 @@ Reduction LoadElimination::ReduceLoadElement(Node* node) {
           return Replace(replacement);
         }
       }
-      state = state->AddElement(object, index, node, zone());
+      state = state->AddElement(object, index, node,
+                                access.machine_type.representation(), zone());
       return UpdateState(node, state);
   }
   return NoChange();
@@ -852,7 +865,8 @@ Reduction LoadElimination::ReduceStoreElement(Node* node) {
   Node* const effect = NodeProperties::GetEffectInput(node);
   AbstractState const* state = node_states_.Get(effect);
   if (state == nullptr) return NoChange();
-  Node* const old_value = state->LookupElement(object, index);
+  Node* const old_value =
+      state->LookupElement(object, index, access.machine_type.representation());
   if (old_value == new_value) {
     // This store is fully redundant.
     return Replace(effect);
@@ -862,9 +876,6 @@ Reduction LoadElimination::ReduceStoreElement(Node* node) {
   // Only record the new value if the store doesn't have an implicit truncation.
   switch (access.machine_type.representation()) {
     case MachineRepresentation::kNone:
-    case MachineRepresentation::kSimd1x4:
-    case MachineRepresentation::kSimd1x8:
-    case MachineRepresentation::kSimd1x16:
     case MachineRepresentation::kBit:
       UNREACHABLE();
       break;
@@ -880,7 +891,8 @@ Reduction LoadElimination::ReduceStoreElement(Node* node) {
     case MachineRepresentation::kTaggedSigned:
     case MachineRepresentation::kTaggedPointer:
     case MachineRepresentation::kTagged:
-      state = state->AddElement(object, index, new_value, zone());
+      state = state->AddElement(object, index, new_value,
+                                access.machine_type.representation(), zone());
       break;
   }
   return UpdateState(node, state);
@@ -1007,8 +1019,15 @@ LoadElimination::AbstractState const* LoadElimination::ComputeLoopState(
                 !ZoneHandleSet<Map>(transition.target())
                      .contains(object_maps)) {
               state = state->KillMaps(object, zone());
-              state = state->KillField(
-                  object, FieldIndexOf(JSObject::kElementsOffset), zone());
+              switch (transition.mode()) {
+                case ElementsTransition::kFastTransition:
+                  break;
+                case ElementsTransition::kSlowTransition:
+                  // Kill the elements as well.
+                  state = state->KillField(
+                      object, FieldIndexOf(JSObject::kElementsOffset), zone());
+                  break;
+              }
             }
             break;
           }
@@ -1067,9 +1086,6 @@ int LoadElimination::FieldIndexOf(FieldAccess const& access) {
     case MachineRepresentation::kNone:
     case MachineRepresentation::kBit:
     case MachineRepresentation::kSimd128:
-    case MachineRepresentation::kSimd1x4:
-    case MachineRepresentation::kSimd1x8:
-    case MachineRepresentation::kSimd1x16:
       UNREACHABLE();
       break;
     case MachineRepresentation::kWord32:

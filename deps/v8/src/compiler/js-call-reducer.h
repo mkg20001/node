@@ -18,6 +18,7 @@ class Factory;
 namespace compiler {
 
 // Forward declarations.
+class CallFrequency;
 class CommonOperatorBuilder;
 class JSGraph;
 class JSOperatorBuilder;
@@ -41,30 +42,35 @@ class JSCallReducer final : public AdvancedReducer {
   Reduction ReduceArrayConstructor(Node* node);
   Reduction ReduceBooleanConstructor(Node* node);
   Reduction ReduceCallApiFunction(
-      Node* node, Node* target,
-      Handle<FunctionTemplateInfo> function_template_info);
+      Node* node, Handle<FunctionTemplateInfo> function_template_info);
   Reduction ReduceNumberConstructor(Node* node);
   Reduction ReduceFunctionPrototypeApply(Node* node);
   Reduction ReduceFunctionPrototypeCall(Node* node);
   Reduction ReduceFunctionPrototypeHasInstance(Node* node);
+  Reduction ReduceObjectGetPrototype(Node* node, Node* object);
+  Reduction ReduceObjectGetPrototypeOf(Node* node);
   Reduction ReduceObjectPrototypeGetProto(Node* node);
-  Reduction ReduceSpreadCall(Node* node, int arity);
+  Reduction ReduceObjectPrototypeIsPrototypeOf(Node* node);
+  Reduction ReduceReflectApply(Node* node);
+  Reduction ReduceReflectConstruct(Node* node);
+  Reduction ReduceReflectGetPrototypeOf(Node* node);
+  Reduction ReduceArrayForEach(Handle<JSFunction> function, Node* node);
+  Reduction ReduceCallOrConstructWithArrayLikeOrSpread(
+      Node* node, int arity, CallFrequency const& frequency);
   Reduction ReduceJSConstruct(Node* node);
+  Reduction ReduceJSConstructWithArrayLike(Node* node);
   Reduction ReduceJSConstructWithSpread(Node* node);
   Reduction ReduceJSCall(Node* node);
+  Reduction ReduceJSCallWithArrayLike(Node* node);
   Reduction ReduceJSCallWithSpread(Node* node);
-
-  enum HolderLookup { kHolderNotFound, kHolderIsReceiver, kHolderFound };
-
-  HolderLookup LookupHolder(Handle<JSObject> object,
-                            Handle<FunctionTemplateInfo> function_template_info,
-                            Handle<JSObject>* holder);
+  Reduction ReduceReturnReceiver(Node* node);
 
   Graph* graph() const;
   JSGraph* jsgraph() const { return jsgraph_; }
   Isolate* isolate() const;
   Factory* factory() const;
   Handle<Context> native_context() const { return native_context_; }
+  Handle<JSGlobalProxy> global_proxy() const;
   CommonOperatorBuilder* common() const;
   JSOperatorBuilder* javascript() const;
   SimplifiedOperatorBuilder* simplified() const;

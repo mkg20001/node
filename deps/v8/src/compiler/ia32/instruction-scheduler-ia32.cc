@@ -99,9 +99,10 @@ int InstructionScheduler::GetTargetInstructionFlags(
     case kIA32BitcastIF:
     case kIA32I32x4Splat:
     case kIA32I32x4ExtractLane:
-    case kIA32I32x4ReplaceLane:
+    case kSSEI32x4ReplaceLane:
     case kSSEI32x4Add:
     case kSSEI32x4Sub:
+    case kAVXI32x4ReplaceLane:
     case kAVXI32x4Add:
     case kAVXI32x4Sub:
       return (instr->addressing_mode() == kMode_None)
@@ -111,8 +112,8 @@ int InstructionScheduler::GetTargetInstructionFlags(
     case kIA32Idiv:
     case kIA32Udiv:
       return (instr->addressing_mode() == kMode_None)
-                 ? kMayNeedDeoptCheck
-                 : kMayNeedDeoptCheck | kIsLoadOperation | kHasSideEffect;
+                 ? kMayNeedDeoptOrTrapCheck
+                 : kMayNeedDeoptOrTrapCheck | kIsLoadOperation | kHasSideEffect;
 
     case kIA32Movsxbl:
     case kIA32Movzxbl:
@@ -143,7 +144,6 @@ int InstructionScheduler::GetTargetInstructionFlags(
   }
 
   UNREACHABLE();
-  return kNoOpcodeFlags;
 }
 
 

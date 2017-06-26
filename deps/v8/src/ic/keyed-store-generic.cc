@@ -132,7 +132,7 @@ void KeyedStoreGenericAssembler::TryRewriteElements(
   DCHECK(IsFastPackedElementsKind(from_kind));
   ElementsKind holey_from_kind = GetHoleyElementsKind(from_kind);
   ElementsKind holey_to_kind = GetHoleyElementsKind(to_kind);
-  if (AllocationSite::GetMode(from_kind, to_kind) == TRACK_ALLOCATION_SITE) {
+  if (AllocationSite::ShouldTrack(from_kind, to_kind)) {
     TrapAllocationMemento(receiver, bailout);
   }
   Label perform_transition(this), check_holey_map(this);
@@ -178,8 +178,7 @@ void KeyedStoreGenericAssembler::TryChangeToHoleyMapHelper(
   Node* packed_map =
       LoadContextElement(native_context, Context::ArrayMapIndex(packed_kind));
   GotoIf(WordNotEqual(receiver_map, packed_map), map_mismatch);
-  if (AllocationSite::GetMode(packed_kind, holey_kind) ==
-      TRACK_ALLOCATION_SITE) {
+  if (AllocationSite::ShouldTrack(packed_kind, holey_kind)) {
     TrapAllocationMemento(receiver, bailout);
   }
   Node* holey_map =
@@ -697,10 +696,9 @@ void KeyedStoreGenericAssembler::OverwriteExistingFastProperty(
 
   BIND(&inobject);
   {
-    Node* field_offset =
-        IntPtrMul(IntPtrSub(LoadMapInstanceSize(object_map),
-                            IntPtrSub(inobject_properties, field_index)),
-                  IntPtrConstant(kPointerSize));
+    Node* field_offset = TimesPointerSize(IntPtrAdd(
+        IntPtrSub(LoadMapInstanceSize(object_map), inobject_properties),
+        field_index));
     Label tagged_rep(this), double_rep(this);
     Branch(Word32Equal(representation, Int32Constant(Representation::kDouble)),
            &double_rep, &tagged_rep);
@@ -789,6 +787,7 @@ void KeyedStoreGenericAssembler::EmitGenericPropertyStore(
 
       BIND(&data_property);
       {
+        CheckForAssociatedProtector(p->name, slow);
         OverwriteExistingFastProperty(receiver, receiver_map, properties,
                                       descriptors, name_index, details,
                                       p->value, slow);
@@ -822,6 +821,7 @@ void KeyedStoreGenericAssembler::EmitGenericPropertyStore(
 
       BIND(&overwrite);
       {
+        CheckForAssociatedProtector(p->name, slow);
         StoreValueByKeyIndex<NameDictionary>(properties, var_name_index.value(),
                                              p->value);
         Return(p->value);
@@ -830,6 +830,7 @@ void KeyedStoreGenericAssembler::EmitGenericPropertyStore(
 
     BIND(&not_found);
     {
+      CheckForAssociatedProtector(p->name, slow);
       Label extensible(this);
       GotoIf(IsPrivateSymbol(p->name), &extensible);
       Node* bitfield2 = LoadMapBitField2(receiver_map);

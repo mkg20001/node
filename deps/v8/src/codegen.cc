@@ -69,23 +69,19 @@ UNARY_MATH_FUNCTION(sqrt, CreateSqrtFunction)
 #undef UNARY_MATH_FUNCTION
 
 
-#define __ ACCESS_MASM(masm_)
-
 #ifdef DEBUG
 
-Comment::Comment(MacroAssembler* masm, const char* msg)
-    : masm_(masm), msg_(msg) {
-  __ RecordComment(msg);
+Comment::Comment(Assembler* assembler, const char* msg)
+    : assembler_(assembler), msg_(msg) {
+  assembler_->RecordComment(msg);
 }
 
 
 Comment::~Comment() {
-  if (msg_[0] == '[') __ RecordComment("]");
+  if (msg_[0] == '[') assembler_->RecordComment("]");
 }
 
 #endif  // DEBUG
-
-#undef __
 
 
 void CodeGenerator::MakeCodePrologue(CompilationInfo* info, const char* kind) {
@@ -126,7 +122,7 @@ Handle<Code> CodeGenerator::MakeCodeEpilogue(MacroAssembler* masm,
   bool is_crankshafted =
       Code::ExtractKindFromFlags(flags) == Code::OPTIMIZED_FUNCTION ||
       info->IsStub();
-  masm->GetCode(&desc);
+  masm->GetCode(isolate, &desc);
   if (eh_frame_writer) eh_frame_writer->GetEhFrame(&desc);
 
   Handle<Code> code = isolate->factory()->NewCode(

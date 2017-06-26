@@ -1090,7 +1090,7 @@ TEST(CodeSerializerLargeCodeObject) {
   Vector<const uint8_t> source =
       ConstructSource(STATIC_CHAR_VECTOR("var j=1; if (j == 0) {"),
                       STATIC_CHAR_VECTOR("for (let i of Object.prototype);"),
-                      STATIC_CHAR_VECTOR("} j=7; j"), 1050);
+                      STATIC_CHAR_VECTOR("} j=7; j"), 1100);
   Handle<String> source_str =
       isolate->factory()->NewStringFromOneByte(source).ToHandleChecked();
 
@@ -1127,6 +1127,8 @@ TEST(CodeSerializerLargeCodeObject) {
 }
 
 TEST(CodeSerializerLargeCodeObjectWithIncrementalMarking) {
+  if (FLAG_never_compact) return;
+  FLAG_stress_incremental_marking = false;
   FLAG_serialize_toplevel = true;
   FLAG_always_opt = false;
   // This test relies on (full-codegen) code objects going to large object
@@ -1148,7 +1150,7 @@ TEST(CodeSerializerLargeCodeObjectWithIncrementalMarking) {
   Vector<const uint8_t> source = ConstructSource(
       STATIC_CHAR_VECTOR("var j=1; if (j == 0) {"),
       STATIC_CHAR_VECTOR("for (var i = 0; i < Object.prototype; i++);"),
-      STATIC_CHAR_VECTOR("} j=7; var s = 'happy_hippo'; j"), 2100);
+      STATIC_CHAR_VECTOR("} j=7; var s = 'happy_hippo'; j"), 2200);
   Handle<String> source_str =
       isolate->factory()->NewStringFromOneByte(source).ToHandleChecked();
 
@@ -1191,7 +1193,7 @@ TEST(CodeSerializerLargeCodeObjectWithIncrementalMarking) {
   // We should have missed a write barrier. Complete incremental marking
   // to flush out the bug.
   heap::SimulateIncrementalMarking(heap, true);
-  CcTest::CollectAllGarbage(Heap::kFinalizeIncrementalMarkingMask);
+  CcTest::CollectAllGarbage();
 
   Handle<JSFunction> copy_fun =
       isolate->factory()->NewFunctionFromSharedFunctionInfo(
@@ -1771,7 +1773,7 @@ TEST(CodeSerializerWithHarmonyScoping) {
 }
 
 TEST(CodeSerializerEagerCompilationAndPreAge) {
-  if (FLAG_ignition || FLAG_turbo) return;
+  if (FLAG_ignition) return;
 
   FLAG_lazy = true;
   FLAG_serialize_toplevel = true;
@@ -1876,7 +1878,7 @@ TEST(CodeSerializerCell) {
     masm->movp(rax, Operand(rax, 0));
     masm->ret(0);
     CodeDesc desc;
-    masm->GetCode(&desc);
+    masm->GetCode(isolate, &desc);
     code = isolate->factory()->NewCode(desc, Code::ComputeFlags(Code::FUNCTION),
                                        masm->CodeObject());
     code->set_has_reloc_info_for_serialization(true);
@@ -1925,7 +1927,7 @@ TEST(CodeSerializerEmbeddedObject) {
     MacroAssembler* masm = &assembler;
     masm->Push(number);
     CodeDesc desc;
-    masm->GetCode(&desc);
+    masm->GetCode(isolate, &desc);
     code = isolate->factory()->NewCode(desc, Code::ComputeFlags(Code::FUNCTION),
                                        masm->CodeObject());
     code->set_has_reloc_info_for_serialization(true);

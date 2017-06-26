@@ -307,9 +307,6 @@ ArchOpcode SelectLoadOpcode(Node* node) {
     case MachineRepresentation::kWord64:  // Fall through.
 #endif
     case MachineRepresentation::kSimd128:  // Fall through.
-    case MachineRepresentation::kSimd1x4:  // Fall through.
-    case MachineRepresentation::kSimd1x8:  // Fall through.
-    case MachineRepresentation::kSimd1x16:  // Fall through.
     case MachineRepresentation::kNone:
     default:
       UNREACHABLE();
@@ -702,6 +699,15 @@ void VisitBinOp(InstructionSelector* selector, Node* node,
 
 }  // namespace
 
+void InstructionSelector::VisitStackSlot(Node* node) {
+  StackSlotRepresentation rep = StackSlotRepresentationOf(node->op());
+  int slot = frame_->AllocateSpillSlot(rep.size());
+  OperandGenerator g(this);
+
+  Emit(kArchStackSlot, g.DefineAsRegister(node),
+       sequence()->AddImmediate(Constant(slot)), 0, nullptr);
+}
+
 void InstructionSelector::VisitLoad(Node* node) {
   S390OperandGenerator g(this);
   ArchOpcode opcode = SelectLoadOpcode(node);
@@ -811,9 +817,6 @@ void InstructionSelector::VisitStore(Node* node) {
       case MachineRepresentation::kWord64:  // Fall through.
 #endif
       case MachineRepresentation::kSimd128:  // Fall through.
-      case MachineRepresentation::kSimd1x4:  // Fall through.
-      case MachineRepresentation::kSimd1x8:  // Fall through.
-      case MachineRepresentation::kSimd1x16:  // Fall through.
       case MachineRepresentation::kNone:
         UNREACHABLE();
         return;
@@ -878,9 +881,6 @@ void InstructionSelector::VisitCheckedLoad(Node* node) {
     case MachineRepresentation::kWord64:  // Fall through.
 #endif
     case MachineRepresentation::kSimd128:  // Fall through.
-    case MachineRepresentation::kSimd1x4:  // Fall through.
-    case MachineRepresentation::kSimd1x8:  // Fall through.
-    case MachineRepresentation::kSimd1x16:  // Fall through.
     case MachineRepresentation::kNone:
       UNREACHABLE();
       return;
@@ -928,9 +928,6 @@ void InstructionSelector::VisitCheckedStore(Node* node) {
     case MachineRepresentation::kWord64:  // Fall through.
 #endif
     case MachineRepresentation::kSimd128:  // Fall through.
-    case MachineRepresentation::kSimd1x4:  // Fall through.
-    case MachineRepresentation::kSimd1x8:  // Fall through.
-    case MachineRepresentation::kSimd1x16:  // Fall through.
     case MachineRepresentation::kNone:
       UNREACHABLE();
       return;
@@ -1711,7 +1708,6 @@ static bool CompareLogical(FlagsContinuation* cont) {
       return false;
   }
   UNREACHABLE();
-  return false;
 }
 
 namespace {
@@ -2050,11 +2046,18 @@ void VisitWordCompareZero(InstructionSelector* selector, Node* user,
                 return VisitWord32BinOp(selector, node, kS390_Sub32,
                                         SubOperandMode, cont);
               case IrOpcode::kInt32MulWithOverflow:
-                cont->OverwriteAndNegateIfEqual(kNotEqual);
-                return VisitWord32BinOp(
-                    selector, node, kS390_Mul32WithOverflow,
-                    OperandMode::kInt32Imm | OperandMode::kAllowDistinctOps,
-                    cont);
+                if (CpuFeatures::IsSupported(MISC_INSTR_EXT2)) {
+                  cont->OverwriteAndNegateIfEqual(kOverflow);
+                  return VisitWord32BinOp(
+                      selector, node, kS390_Mul32,
+                      OperandMode::kAllowRRR | OperandMode::kAllowRM, cont);
+                } else {
+                  cont->OverwriteAndNegateIfEqual(kNotEqual);
+                  return VisitWord32BinOp(
+                      selector, node, kS390_Mul32WithOverflow,
+                      OperandMode::kInt32Imm | OperandMode::kAllowDistinctOps,
+                      cont);
+                }
               case IrOpcode::kInt32AbsWithOverflow:
                 cont->OverwriteAndNegateIfEqual(kOverflow);
                 return VisitWord32UnaryOp(selector, node, kS390_Abs32,

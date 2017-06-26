@@ -10,6 +10,7 @@
 #include "src/compiler/wasm-compiler.h"
 #include "src/debug/debug-interface.h"
 #include "src/objects-inl.h"
+#include "src/objects/debug-objects-inl.h"
 #include "src/wasm/module-decoder.h"
 #include "src/wasm/wasm-code-specialization.h"
 #include "src/wasm/wasm-module.h"
@@ -73,8 +74,8 @@ namespace {
 // An iterator that returns first the module itself, then all modules linked via
 // next, then all linked via prev.
 class CompiledModulesIterator
-    : public std::iterator<std::input_iterator_tag,
-                           Handle<WasmCompiledModule>> {
+    : public v8::base::iterator<std::input_iterator_tag,
+                                Handle<WasmCompiledModule>> {
  public:
   CompiledModulesIterator(Isolate* isolate,
                           Handle<WasmCompiledModule> start_module, bool at_end)
@@ -131,8 +132,8 @@ class CompiledModulesIterator
 // An iterator based on the CompiledModulesIterator, but it returns all live
 // instances, not the WasmCompiledModules itself.
 class CompiledModuleInstancesIterator
-    : public std::iterator<std::input_iterator_tag,
-                           Handle<WasmInstanceObject>> {
+    : public v8::base::iterator<std::input_iterator_tag,
+                                Handle<WasmInstanceObject>> {
  public:
   CompiledModuleInstancesIterator(Isolate* isolate,
                                   Handle<WasmCompiledModule> start_module,
@@ -182,8 +183,8 @@ bool IsBreakablePosition(Handle<WasmCompiledModule> compiled_module,
   BodyLocalDecls locals(&tmp);
   const byte* module_start = compiled_module->module_bytes()->GetChars();
   WasmFunction& func = compiled_module->module()->functions[func_index];
-  BytecodeIterator iterator(module_start + func.code_start_offset,
-                            module_start + func.code_end_offset, &locals);
+  BytecodeIterator iterator(module_start + func.code.offset(),
+                            module_start + func.code.end_offset(), &locals);
   DCHECK_LT(0, locals.encoded_size);
   for (uint32_t offset : iterator.offsets()) {
     if (offset > static_cast<uint32_t>(offset_in_func)) break;
@@ -259,8 +260,6 @@ Handle<WasmTableObject> WasmTableObject::New(Isolate* isolate, uint32_t initial,
   return Handle<WasmTableObject>::cast(table_obj);
 }
 
-DEFINE_OBJ_GETTER(WasmTableObject, dispatch_tables, kDispatchTables, FixedArray)
-
 Handle<FixedArray> WasmTableObject::AddDispatchTable(
     Isolate* isolate, Handle<WasmTableObject> table_obj,
     Handle<WasmInstanceObject> instance, int table_index,
@@ -290,6 +289,8 @@ Handle<FixedArray> WasmTableObject::AddDispatchTable(
 
 DEFINE_OBJ_ACCESSORS(WasmTableObject, functions, kFunctions, FixedArray)
 
+DEFINE_OBJ_GETTER(WasmTableObject, dispatch_tables, kDispatchTables, FixedArray)
+
 uint32_t WasmTableObject::current_length() { return functions()->length(); }
 
 bool WasmTableObject::has_maximum_length() {
@@ -306,11 +307,36 @@ WasmTableObject* WasmTableObject::cast(Object* object) {
   return reinterpret_cast<WasmTableObject*>(object);
 }
 
-void WasmTableObject::Grow(Isolate* isolate, Handle<WasmTableObject> table,
-                           uint32_t count) {
-  Handle<FixedArray> dispatch_tables(table->dispatch_tables());
-  wasm::GrowDispatchTables(isolate, dispatch_tables,
-                           table->functions()->length(), count);
+void WasmTableObject::grow(Isolate* isolate, uint32_t count) {
+  Handle<FixedArray> dispatch_tables(
+      FixedArray::cast(GetEmbedderField(kDispatchTables)));
+  DCHECK_EQ(0, dispatch_tables->length() % 4);
+  uint32_t old_size = functions()->length();
+
+  Zone specialization_zone(isolate->allocator(), ZONE_NAME);
+  for (int i = 0; i < dispatch_tables->length(); i += 4) {
+    Handle<FixedArray> old_function_table(
+        FixedArray::cast(dispatch_tables->get(i + 2)));
+    Handle<FixedArray> old_signature_table(
+        FixedArray::cast(dispatch_tables->get(i + 3)));
+    Handle<FixedArray> new_function_table =
+        isolate->factory()->CopyFixedArrayAndGrow(old_function_table, count);
+    Handle<FixedArray> new_signature_table =
+        isolate->factory()->CopyFixedArrayAndGrow(old_signature_table, count);
+
+    // Update dispatch tables with new function/signature tables
+    dispatch_tables->set(i + 2, *new_function_table);
+    dispatch_tables->set(i + 3, *new_signature_table);
+
+    // Patch the code of the respective instance.
+    CodeSpecialization code_specialization(isolate, &specialization_zone);
+    code_specialization.PatchTableSize(old_size, old_size + count);
+    code_specialization.RelocateObject(old_function_table, new_function_table);
+    code_specialization.RelocateObject(old_signature_table,
+                                       new_signature_table);
+    code_specialization.ApplyToWholeInstance(
+        WasmInstanceObject::cast(dispatch_tables->get(i)));
+  }
 }
 
 namespace {
@@ -321,15 +347,14 @@ Handle<JSArrayBuffer> GrowMemoryBuffer(Isolate* isolate,
   Address old_mem_start = nullptr;
   uint32_t old_size = 0;
   if (!old_buffer.is_null()) {
-    DCHECK(old_buffer->byte_length()->IsNumber());
     old_mem_start = static_cast<Address>(old_buffer->backing_store());
-    old_size = old_buffer->byte_length()->Number();
+    CHECK(old_buffer->byte_length()->ToUint32(&old_size));
   }
+  DCHECK_EQ(0, old_size % WasmModule::kPageSize);
+  uint32_t old_pages = old_size / WasmModule::kPageSize;
   DCHECK_GE(std::numeric_limits<uint32_t>::max(),
             old_size + pages * WasmModule::kPageSize);
-  uint32_t new_size = old_size + pages * WasmModule::kPageSize;
-  if (new_size <= old_size || max_pages * WasmModule::kPageSize < new_size ||
-      FLAG_wasm_max_mem_pages * WasmModule::kPageSize < new_size) {
+  if (old_pages > max_pages || pages > max_pages - old_pages) {
     return Handle<JSArrayBuffer>::null();
   }
 
@@ -338,6 +363,8 @@ Handle<JSArrayBuffer> GrowMemoryBuffer(Isolate* isolate,
   const bool enable_guard_regions =
       (old_buffer.is_null() && EnableGuardRegions()) ||
       (!old_buffer.is_null() && old_buffer->has_guard_region());
+  size_t new_size =
+      static_cast<size_t>(old_pages + pages) * WasmModule::kPageSize;
   Handle<JSArrayBuffer> new_buffer =
       NewArrayBuffer(isolate, new_size, enable_guard_regions);
   if (new_buffer.is_null()) return new_buffer;
@@ -382,7 +409,11 @@ Handle<WasmMemoryObject> WasmMemoryObject::New(Isolate* isolate,
   Handle<JSObject> memory_obj =
       isolate->factory()->NewJSObject(memory_ctor, TENURED);
   memory_obj->SetEmbedderField(kWrapperTracerHeader, Smi::kZero);
-
+  if (buffer.is_null()) {
+    const bool enable_guard_regions = EnableGuardRegions();
+    buffer = SetupArrayBuffer(isolate, nullptr, 0, nullptr, 0, false,
+                              enable_guard_regions);
+  }
   memory_obj->SetEmbedderField(kArrayBuffer, *buffer);
   Handle<Object> max = isolate->factory()->NewNumber(maximum);
   memory_obj->SetEmbedderField(kMaximum, *max);
@@ -438,23 +469,19 @@ void WasmMemoryObject::ResetInstancesLink(Isolate* isolate) {
 int32_t WasmMemoryObject::Grow(Isolate* isolate,
                                Handle<WasmMemoryObject> memory_object,
                                uint32_t pages) {
-  Handle<JSArrayBuffer> old_buffer(memory_object->buffer(), isolate);
+  Handle<JSArrayBuffer> old_buffer(memory_object->buffer());
   uint32_t old_size = 0;
-  Address old_mem_start = nullptr;
-  // Force byte_length to 0, if byte_length fails IsNumber() check.
-  if (!old_buffer.is_null()) {
-    old_size = old_buffer->byte_length()->Number();
-    old_mem_start = static_cast<Address>(old_buffer->backing_store());
-  }
+  CHECK(old_buffer->byte_length()->ToUint32(&old_size));
   Handle<JSArrayBuffer> new_buffer;
   // Return current size if grow by 0.
   if (pages == 0) {
     // Even for pages == 0, we need to attach a new JSArrayBuffer with the same
     // backing store and neuter the old one to be spec compliant.
-    if (!old_buffer.is_null() && old_size != 0) {
-      new_buffer = SetupArrayBuffer(isolate, old_buffer->backing_store(),
-                                    old_size, old_buffer->is_external(),
-                                    old_buffer->has_guard_region());
+    if (old_size != 0) {
+      new_buffer = SetupArrayBuffer(
+          isolate, old_buffer->allocation_base(),
+          old_buffer->allocation_length(), old_buffer->backing_store(),
+          old_size, old_buffer->is_external(), old_buffer->has_guard_region());
       memory_object->set_buffer(*new_buffer);
     }
     DCHECK_EQ(0, old_size % WasmModule::kPageSize);
@@ -485,6 +512,7 @@ int32_t WasmMemoryObject::Grow(Isolate* isolate,
     if (new_buffer.is_null()) return -1;
     DCHECK(!instance_wrapper->has_previous());
     SetInstanceMemory(isolate, instance, new_buffer);
+    Address old_mem_start = static_cast<Address>(old_buffer->backing_store());
     UncheckedUpdateInstanceMemory(isolate, instance, old_mem_start, old_size);
     while (instance_wrapper->has_next()) {
       instance_wrapper = instance_wrapper->next_wrapper();
@@ -512,6 +540,8 @@ DEFINE_OPTIONAL_OBJ_ACCESSORS(WasmInstanceObject, debug_info, kDebugInfo,
                               WasmDebugInfo)
 DEFINE_OPTIONAL_OBJ_ACCESSORS(WasmInstanceObject, instance_wrapper,
                               kWasmMemInstanceWrapper, WasmInstanceWrapper)
+DEFINE_OPTIONAL_OBJ_ACCESSORS(WasmInstanceObject, directly_called_instances,
+                              kDirectlyCalledInstances, FixedArray)
 
 WasmModuleObject* WasmInstanceObject::module_object() {
   return *compiled_module()->wasm_module();
@@ -523,7 +553,7 @@ Handle<WasmDebugInfo> WasmInstanceObject::GetOrCreateDebugInfo(
     Handle<WasmInstanceObject> instance) {
   if (instance->has_debug_info()) return handle(instance->debug_info());
   Handle<WasmDebugInfo> new_info = WasmDebugInfo::New(instance);
-  instance->set_debug_info(*new_info);
+  DCHECK(instance->has_debug_info());
   return new_info;
 }
 
@@ -619,10 +649,9 @@ uint32_t WasmInstanceObject::GetMaxMemoryPages() {
   }
   uint32_t compiled_max_pages = compiled_module()->module()->max_mem_pages;
   Isolate* isolate = GetIsolate();
-  auto* histogram = (compiled_module()->module()->is_wasm()
-                         ? isolate->counters()->wasm_wasm_max_mem_pages_count()
-                         : isolate->counters()->wasm_asm_max_mem_pages_count());
-  histogram->AddSample(compiled_max_pages);
+  assert(compiled_module()->module()->is_wasm());
+  isolate->counters()->wasm_wasm_max_mem_pages_count()->AddSample(
+      compiled_max_pages);
   if (compiled_max_pages != 0) return compiled_max_pages;
   return FLAG_wasm_max_mem_pages;
 }
@@ -778,7 +807,9 @@ void WasmSharedModuleData::ReinitializeAfterDeserialization(
         DecodeWasmModule(isolate, start, end, false, kWasmOrigin);
     CHECK(result.ok());
     CHECK_NOT_NULL(result.val);
-    module = const_cast<WasmModule*>(result.val);
+    // Take ownership of the WasmModule and immediately transfer it to the
+    // WasmModuleWrapper below.
+    module = result.val.release();
   }
 
   Handle<WasmModuleWrapper> module_wrapper =
@@ -903,7 +934,7 @@ void WasmSharedModuleData::SetBreakpointsOnNewInstance(
     int func_index = compiled_module->GetContainingFunction(position);
     DCHECK_LE(0, func_index);
     WasmFunction& func = compiled_module->module()->functions[func_index];
-    int offset_in_func = position - func.code_start_offset;
+    int offset_in_func = position - func.code.offset();
     WasmDebugInfo::SetBreakpoint(debug_info, func_index, offset_in_func);
   }
 }
@@ -987,6 +1018,9 @@ void WasmCompiledModule::Reset(Isolate* isolate,
   Object* fct_obj = compiled_module->ptr_to_code_table();
   if (fct_obj != nullptr && fct_obj != undefined) {
     uint32_t old_mem_size = compiled_module->mem_size();
+    // We use default_mem_size throughout, as the mem size of an uninstantiated
+    // module, because if we can statically prove a memory access is over
+    // bounds, we'll codegen a trap. See {WasmGraphBuilder::BoundsCheckMem}
     uint32_t default_mem_size = compiled_module->default_mem_size();
     Address old_mem_start = compiled_module->GetEmbeddedMemStartOrNull();
 
@@ -1062,7 +1096,7 @@ void WasmCompiledModule::InitId() {
 void WasmCompiledModule::ResetSpecializationMemInfoIfNeeded() {
   DisallowHeapAllocation no_gc;
   if (has_embedded_mem_start()) {
-    set_embedded_mem_size(0);
+    set_embedded_mem_size(default_mem_size());
     set_embedded_mem_start(0);
   }
 }
@@ -1100,20 +1134,21 @@ void WasmCompiledModule::SetGlobalsStartAddressFrom(
 
 MaybeHandle<String> WasmCompiledModule::ExtractUtf8StringFromModuleBytes(
     Isolate* isolate, Handle<WasmCompiledModule> compiled_module,
-    uint32_t offset, uint32_t size) {
+    WireBytesRef ref) {
   // TODO(wasm): cache strings from modules if it's a performance win.
   Handle<SeqOneByteString> module_bytes(compiled_module->module_bytes(),
                                         isolate);
-  DCHECK_GE(module_bytes->length(), offset);
-  DCHECK_GE(module_bytes->length() - offset, size);
+  DCHECK_GE(module_bytes->length(), ref.end_offset());
   // UTF8 validation happens at decode time.
-  DCHECK(unibrow::Utf8::Validate(
-      reinterpret_cast<const byte*>(module_bytes->GetCharsAddress() + offset),
-      size));
-  DCHECK_GE(kMaxInt, offset);
-  DCHECK_GE(kMaxInt, size);
+  DCHECK(unibrow::Utf8::ValidateEncoding(
+      reinterpret_cast<const byte*>(module_bytes->GetCharsAddress() +
+                                    ref.offset()),
+      ref.length()));
+  DCHECK_GE(kMaxInt, ref.offset());
+  DCHECK_GE(kMaxInt, ref.length());
   return isolate->factory()->NewStringFromUtf8SubString(
-      module_bytes, static_cast<int>(offset), static_cast<int>(size));
+      module_bytes, static_cast<int>(ref.offset()),
+      static_cast<int>(ref.length()));
 }
 
 bool WasmCompiledModule::IsWasmCompiledModule(Object* obj) {
@@ -1189,15 +1224,22 @@ uint32_t WasmCompiledModule::default_mem_size() const {
   return min_mem_pages() * WasmModule::kPageSize;
 }
 
+MaybeHandle<String> WasmCompiledModule::GetModuleNameOrNull(
+    Isolate* isolate, Handle<WasmCompiledModule> compiled_module) {
+  WasmModule* module = compiled_module->module();
+  if (!module->name.is_set()) return {};
+  return WasmCompiledModule::ExtractUtf8StringFromModuleBytes(
+      isolate, compiled_module, module->name);
+}
+
 MaybeHandle<String> WasmCompiledModule::GetFunctionNameOrNull(
     Isolate* isolate, Handle<WasmCompiledModule> compiled_module,
     uint32_t func_index) {
   DCHECK_LT(func_index, compiled_module->module()->functions.size());
   WasmFunction& function = compiled_module->module()->functions[func_index];
-  DCHECK_IMPLIES(function.name_offset == 0, function.name_length == 0);
-  if (!function.name_offset) return {};
+  if (!function.name.is_set()) return {};
   return WasmCompiledModule::ExtractUtf8StringFromModuleBytes(
-      isolate, compiled_module, function.name_offset, function.name_length);
+      isolate, compiled_module, function.name);
 }
 
 Handle<String> WasmCompiledModule::GetFunctionName(
@@ -1214,17 +1256,17 @@ Vector<const uint8_t> WasmCompiledModule::GetRawFunctionName(
   DCHECK_GT(module()->functions.size(), func_index);
   WasmFunction& function = module()->functions[func_index];
   SeqOneByteString* bytes = module_bytes();
-  DCHECK_GE(bytes->length(), function.name_offset);
-  DCHECK_GE(bytes->length() - function.name_offset, function.name_length);
-  return Vector<const uint8_t>(bytes->GetCharsAddress() + function.name_offset,
-                               function.name_length);
+  DCHECK_GE(bytes->length(), function.name.end_offset());
+  return Vector<const uint8_t>(
+      bytes->GetCharsAddress() + function.name.offset(),
+      function.name.length());
 }
 
 int WasmCompiledModule::GetFunctionOffset(uint32_t func_index) {
   std::vector<WasmFunction>& functions = module()->functions;
   if (static_cast<uint32_t>(func_index) >= functions.size()) return -1;
-  DCHECK_GE(kMaxInt, functions[func_index].code_start_offset);
-  return static_cast<int>(functions[func_index].code_start_offset);
+  DCHECK_GE(kMaxInt, functions[func_index].code.offset());
+  return static_cast<int>(functions[func_index].code.offset());
 }
 
 int WasmCompiledModule::GetContainingFunction(uint32_t byte_offset) {
@@ -1236,7 +1278,7 @@ int WasmCompiledModule::GetContainingFunction(uint32_t byte_offset) {
   if (right == 0) return false;
   while (right - left > 1) {
     int mid = left + (right - left) / 2;
-    if (functions[mid].code_start_offset <= byte_offset) {
+    if (functions[mid].code.offset() <= byte_offset) {
       left = mid;
     } else {
       right = mid;
@@ -1244,8 +1286,8 @@ int WasmCompiledModule::GetContainingFunction(uint32_t byte_offset) {
   }
   // If the found function does not contains the given position, return -1.
   WasmFunction& func = functions[left];
-  if (byte_offset < func.code_start_offset ||
-      byte_offset >= func.code_end_offset) {
+  if (byte_offset < func.code.offset() ||
+      byte_offset >= func.code.end_offset()) {
     return -1;
   }
 
@@ -1260,9 +1302,9 @@ bool WasmCompiledModule::GetPositionInfo(uint32_t position,
   WasmFunction& function = module()->functions[func_index];
 
   info->line = func_index;
-  info->column = position - function.code_start_offset;
-  info->line_start = function.code_start_offset;
-  info->line_end = function.code_end_offset;
+  info->column = position - function.code.offset();
+  info->line_start = function.code.offset();
+  info->line_end = function.code.end_offset();
   return true;
 }
 
@@ -1323,8 +1365,7 @@ Handle<ByteArray> GetDecodedAsmJsOffsetTable(
   for (int func = 0; func < num_functions; ++func) {
     std::vector<AsmJsOffsetEntry>& func_asm_offsets = asm_offsets.val[func];
     if (func_asm_offsets.empty()) continue;
-    int func_offset =
-        wasm_funs[num_imported_functions + func].code_start_offset;
+    int func_offset = wasm_funs[num_imported_functions + func].code.offset();
     for (AsmJsOffsetEntry& e : func_asm_offsets) {
       // Byte offsets must be strictly monotonously increasing:
       DCHECK_IMPLIES(idx > 0, func_offset + e.byte_offset >
@@ -1351,7 +1392,7 @@ int WasmCompiledModule::GetAsmJsSourcePosition(
 
   DCHECK_LT(func_index, compiled_module->module()->functions.size());
   uint32_t func_code_offset =
-      compiled_module->module()->functions[func_index].code_start_offset;
+      compiled_module->module()->functions[func_index].code.offset();
   uint32_t total_offset = func_code_offset + byte_offset;
 
   // Binary search for the total byte offset.
@@ -1412,17 +1453,16 @@ bool WasmCompiledModule::GetPossibleBreakpoints(
   // start_offset and end_offset are module-relative byte offsets.
   uint32_t start_func_index = start.GetLineNumber();
   if (start_func_index >= functions.size()) return false;
-  int start_func_len = functions[start_func_index].code_end_offset -
-                       functions[start_func_index].code_start_offset;
+  int start_func_len = functions[start_func_index].code.length();
   if (start.GetColumnNumber() > start_func_len) return false;
   uint32_t start_offset =
-      functions[start_func_index].code_start_offset + start.GetColumnNumber();
+      functions[start_func_index].code.offset() + start.GetColumnNumber();
   uint32_t end_func_index;
   uint32_t end_offset;
   if (end.IsEmpty()) {
     // Default: everything till the end of the Script.
     end_func_index = static_cast<uint32_t>(functions.size() - 1);
-    end_offset = functions[end_func_index].code_end_offset;
+    end_offset = functions[end_func_index].code.end_offset();
   } else {
     // If end is specified: Use it and check for valid input.
     end_func_index = static_cast<uint32_t>(end.GetLineNumber());
@@ -1432,12 +1472,13 @@ bool WasmCompiledModule::GetPossibleBreakpoints(
     // next function also.
     if (end.GetColumnNumber() == 0 && end_func_index > 0) {
       --end_func_index;
-      end_offset = functions[end_func_index].code_end_offset;
+      end_offset = functions[end_func_index].code.end_offset();
     } else {
       if (end_func_index >= functions.size()) return false;
       end_offset =
-          functions[end_func_index].code_start_offset + end.GetColumnNumber();
-      if (end_offset > functions[end_func_index].code_end_offset) return false;
+          functions[end_func_index].code.offset() + end.GetColumnNumber();
+      if (end_offset > functions[end_func_index].code.end_offset())
+        return false;
     }
   }
 
@@ -1448,14 +1489,14 @@ bool WasmCompiledModule::GetPossibleBreakpoints(
   for (uint32_t func_idx = start_func_index; func_idx <= end_func_index;
        ++func_idx) {
     WasmFunction& func = functions[func_idx];
-    if (func.code_start_offset == func.code_end_offset) continue;
+    if (func.code.length() == 0) continue;
 
     BodyLocalDecls locals(&tmp);
-    BytecodeIterator iterator(module_start + func.code_start_offset,
-                              module_start + func.code_end_offset, &locals);
+    BytecodeIterator iterator(module_start + func.code.offset(),
+                              module_start + func.code.end_offset(), &locals);
     DCHECK_LT(0u, locals.encoded_size);
     for (uint32_t offset : iterator.offsets()) {
-      uint32_t total_offset = func.code_start_offset + offset;
+      uint32_t total_offset = func.code.offset() + offset;
       if (total_offset >= end_offset) {
         DCHECK_EQ(end_func_index, func_idx);
         break;
@@ -1476,7 +1517,7 @@ bool WasmCompiledModule::SetBreakPoint(
   int func_index = compiled_module->GetContainingFunction(*position);
   if (func_index < 0) return false;
   WasmFunction& func = compiled_module->module()->functions[func_index];
-  int offset_in_func = *position - func.code_start_offset;
+  int offset_in_func = *position - func.code.offset();
 
   // According to the current design, we should only be called with valid
   // breakable positions.
@@ -1519,7 +1560,7 @@ MaybeHandle<FixedArray> WasmCompiledModule::CheckBreakPoints(int position) {
   return isolate->debug()->GetHitBreakPointObjects(breakpoint_objects);
 }
 
-MaybeHandle<Code> WasmCompiledModule::CompileLazy(
+Handle<Code> WasmCompiledModule::CompileLazy(
     Isolate* isolate, Handle<WasmInstanceObject> instance, Handle<Code> caller,
     int offset, int func_index, bool patch_caller) {
   isolate->set_context(*instance->compiled_module()->native_context());

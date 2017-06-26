@@ -275,28 +275,50 @@ class Immediate BASE_EMBEDDED {
   inline explicit Immediate(Address addr);
   inline explicit Immediate(Address x, RelocInfo::Mode rmode);
 
+  static Immediate EmbeddedNumber(double value);  // Smi or HeapNumber.
+
   static Immediate CodeRelativeOffset(Label* label) {
     return Immediate(label);
   }
 
-  bool is_zero() const { return x_ == 0 && RelocInfo::IsNone(rmode_); }
+  bool is_heap_number() const {
+    DCHECK_IMPLIES(is_heap_number_, rmode_ == RelocInfo::EMBEDDED_OBJECT);
+    return is_heap_number_;
+  }
+
+  double heap_number() const {
+    DCHECK(is_heap_number());
+    return value_.heap_number;
+  }
+
+  int immediate() const {
+    DCHECK(!is_heap_number());
+    return value_.immediate;
+  }
+
+  bool is_zero() const { return RelocInfo::IsNone(rmode_) && immediate() == 0; }
   bool is_int8() const {
-    return -128 <= x_ && x_ < 128 && RelocInfo::IsNone(rmode_);
+    return RelocInfo::IsNone(rmode_) && i::is_int8(immediate());
   }
   bool is_uint8() const {
-    return v8::internal::is_uint8(x_) && RelocInfo::IsNone(rmode_);
+    return RelocInfo::IsNone(rmode_) && i::is_uint8(immediate());
   }
   bool is_int16() const {
-    return -32768 <= x_ && x_ < 32768 && RelocInfo::IsNone(rmode_);
+    return RelocInfo::IsNone(rmode_) && i::is_int16(immediate());
   }
+
   bool is_uint16() const {
-    return v8::internal::is_uint16(x_) && RelocInfo::IsNone(rmode_);
+    return RelocInfo::IsNone(rmode_) && i::is_uint16(immediate());
   }
 
  private:
   inline explicit Immediate(Label* value);
 
-  int x_;
+  union {
+    double heap_number;
+    int immediate;
+  } value_;
+  bool is_heap_number_ = false;
   RelocInfo::Mode rmode_;
 
   friend class Operand;
@@ -375,7 +397,7 @@ class Operand BASE_EMBEDDED {
   }
 
   static Operand ForRegisterPlusImmediate(Register base, Immediate imm) {
-    return Operand(base, imm.x_, imm.rmode_);
+    return Operand(base, imm.value_.immediate, imm.rmode_);
   }
 
   // Returns true if this Operand is a wrapper for the specified register.
@@ -493,7 +515,7 @@ class Assembler : public AssemblerBase {
   // GetCode emits any pending (non-emitted) code and fills the descriptor
   // desc. GetCode() is idempotent; it returns the same result if no other
   // Assembler functions are invoked in between GetCode() calls.
-  void GetCode(CodeDesc* desc);
+  void GetCode(Isolate* isolate, CodeDesc* desc);
 
   // Read/Modify the code target in the branch/call instruction at pc.
   // The isolate argument is unused (and may be nullptr) when skipping flushing.
@@ -841,9 +863,7 @@ class Assembler : public AssemblerBase {
   void call(Register reg) { call(Operand(reg)); }
   void call(const Operand& adr);
   int CallSize(Handle<Code> code, RelocInfo::Mode mode);
-  void call(Handle<Code> code,
-            RelocInfo::Mode rmode,
-            TypeFeedbackId id = TypeFeedbackId::None());
+  void call(Handle<Code> code, RelocInfo::Mode rmode);
 
   // Jumps
   // unconditional jump to L
@@ -980,11 +1000,29 @@ class Assembler : public AssemblerBase {
   void mulps(XMMRegister dst, XMMRegister src) { mulps(dst, Operand(src)); }
   void divps(XMMRegister dst, const Operand& src);
   void divps(XMMRegister dst, XMMRegister src) { divps(dst, Operand(src)); }
+  void rcpps(XMMRegister dst, const Operand& src);
+  void rcpps(XMMRegister dst, XMMRegister src) { rcpps(dst, Operand(src)); }
+  void rsqrtps(XMMRegister dst, const Operand& src);
+  void rsqrtps(XMMRegister dst, XMMRegister src) { rsqrtps(dst, Operand(src)); }
 
   void minps(XMMRegister dst, const Operand& src);
   void minps(XMMRegister dst, XMMRegister src) { minps(dst, Operand(src)); }
   void maxps(XMMRegister dst, const Operand& src);
   void maxps(XMMRegister dst, XMMRegister src) { maxps(dst, Operand(src)); }
+
+  void cmpps(XMMRegister dst, const Operand& src, int8_t cmp);
+#define SSE_CMP_P(instr, imm8)                       \
+  void instr##ps(XMMRegister dst, XMMRegister src) { \
+    cmpps(dst, Operand(src), imm8);                  \
+  }                                                  \
+  void instr##ps(XMMRegister dst, const Operand& src) { cmpps(dst, src, imm8); }
+
+  SSE_CMP_P(cmpeq, 0x0);
+  SSE_CMP_P(cmplt, 0x1);
+  SSE_CMP_P(cmple, 0x2);
+  SSE_CMP_P(cmpneq, 0x4);
+
+#undef SSE_CMP_P
 
   // SSE2 instructions
   void cvttss2si(Register dst, const Operand& src);
@@ -1009,6 +1047,15 @@ class Assembler : public AssemblerBase {
   void cvtsd2ss(XMMRegister dst, XMMRegister src) {
     cvtsd2ss(dst, Operand(src));
   }
+  void cvtdq2ps(XMMRegister dst, XMMRegister src) {
+    cvtdq2ps(dst, Operand(src));
+  }
+  void cvtdq2ps(XMMRegister dst, const Operand& src);
+  void cvttps2dq(XMMRegister dst, XMMRegister src) {
+    cvttps2dq(dst, Operand(src));
+  }
+  void cvttps2dq(XMMRegister dst, const Operand& src);
+
   void addsd(XMMRegister dst, XMMRegister src) { addsd(dst, Operand(src)); }
   void addsd(XMMRegister dst, const Operand& src);
   void subsd(XMMRegister dst, XMMRegister src) { subsd(dst, Operand(src)); }
@@ -1078,11 +1125,37 @@ class Assembler : public AssemblerBase {
   void psllq(XMMRegister dst, XMMRegister src);
   void psrlq(XMMRegister reg, int8_t shift);
   void psrlq(XMMRegister dst, XMMRegister src);
-  void pshufd(XMMRegister dst, XMMRegister src, uint8_t shuffle);
+
+  // pshufb is SSSE3 instruction
+  void pshufb(XMMRegister dst, XMMRegister src) { pshufb(dst, Operand(src)); }
+  void pshufb(XMMRegister dst, const Operand& src);
+  void pshuflw(XMMRegister dst, XMMRegister src, uint8_t shuffle) {
+    pshuflw(dst, Operand(src), shuffle);
+  }
+  void pshuflw(XMMRegister dst, const Operand& src, uint8_t shuffle);
+  void pshufd(XMMRegister dst, XMMRegister src, uint8_t shuffle) {
+    pshufd(dst, Operand(src), shuffle);
+  }
+  void pshufd(XMMRegister dst, const Operand& src, uint8_t shuffle);
+
+  void pextrb(Register dst, XMMRegister src, int8_t offset) {
+    pextrb(Operand(dst), src, offset);
+  }
+  void pextrb(const Operand& dst, XMMRegister src, int8_t offset);
+  // Use SSE4_1 encoding for pextrw reg, xmm, imm8 for consistency
+  void pextrw(Register dst, XMMRegister src, int8_t offset) {
+    pextrw(Operand(dst), src, offset);
+  }
+  void pextrw(const Operand& dst, XMMRegister src, int8_t offset);
   void pextrd(Register dst, XMMRegister src, int8_t offset) {
     pextrd(Operand(dst), src, offset);
   }
   void pextrd(const Operand& dst, XMMRegister src, int8_t offset);
+
+  void pinsrb(XMMRegister dst, Register src, int8_t offset) {
+    pinsrb(dst, Operand(src), offset);
+  }
+  void pinsrb(XMMRegister dst, const Operand& src, int8_t offset);
   void pinsrw(XMMRegister dst, Register src, int8_t offset) {
     pinsrw(dst, Operand(src), offset);
   }
@@ -1317,12 +1390,92 @@ class Assembler : public AssemblerBase {
   }
   void vss(byte op, XMMRegister dst, XMMRegister src1, const Operand& src2);
 
+  void vrcpps(XMMRegister dst, XMMRegister src) { vrcpps(dst, Operand(src)); }
+  void vrcpps(XMMRegister dst, const Operand& src) {
+    vinstr(0x53, dst, xmm0, src, kNone, k0F, kWIG);
+  }
+  void vrsqrtps(XMMRegister dst, XMMRegister src) {
+    vrsqrtps(dst, Operand(src));
+  }
+  void vrsqrtps(XMMRegister dst, const Operand& src) {
+    vinstr(0x52, dst, xmm0, src, kNone, k0F, kWIG);
+  }
+
   void vpsllw(XMMRegister dst, XMMRegister src, int8_t imm8);
   void vpslld(XMMRegister dst, XMMRegister src, int8_t imm8);
   void vpsrlw(XMMRegister dst, XMMRegister src, int8_t imm8);
   void vpsrld(XMMRegister dst, XMMRegister src, int8_t imm8);
   void vpsraw(XMMRegister dst, XMMRegister src, int8_t imm8);
   void vpsrad(XMMRegister dst, XMMRegister src, int8_t imm8);
+
+  void vpshufb(XMMRegister dst, XMMRegister src1, XMMRegister src2) {
+    vpshufb(dst, src1, Operand(src2));
+  }
+  void vpshufb(XMMRegister dst, XMMRegister src1, const Operand& src2) {
+    vinstr(0x00, dst, src1, src2, k66, k0F38, kW0);
+  }
+  void vpshuflw(XMMRegister dst, XMMRegister src, uint8_t shuffle) {
+    vpshuflw(dst, Operand(src), shuffle);
+  }
+  void vpshuflw(XMMRegister dst, const Operand& src, uint8_t shuffle);
+  void vpshufd(XMMRegister dst, XMMRegister src, uint8_t shuffle) {
+    vpshufd(dst, Operand(src), shuffle);
+  }
+  void vpshufd(XMMRegister dst, const Operand& src, uint8_t shuffle);
+
+  void vpextrb(Register dst, XMMRegister src, int8_t offset) {
+    vpextrb(Operand(dst), src, offset);
+  }
+  void vpextrb(const Operand& dst, XMMRegister src, int8_t offset);
+  void vpextrw(Register dst, XMMRegister src, int8_t offset) {
+    vpextrw(Operand(dst), src, offset);
+  }
+  void vpextrw(const Operand& dst, XMMRegister src, int8_t offset);
+  void vpextrd(Register dst, XMMRegister src, int8_t offset) {
+    vpextrd(Operand(dst), src, offset);
+  }
+  void vpextrd(const Operand& dst, XMMRegister src, int8_t offset);
+
+  void vpinsrb(XMMRegister dst, XMMRegister src1, Register src2,
+               int8_t offset) {
+    vpinsrb(dst, src1, Operand(src2), offset);
+  }
+  void vpinsrb(XMMRegister dst, XMMRegister src1, const Operand& src2,
+               int8_t offset);
+  void vpinsrw(XMMRegister dst, XMMRegister src1, Register src2,
+               int8_t offset) {
+    vpinsrw(dst, src1, Operand(src2), offset);
+  }
+  void vpinsrw(XMMRegister dst, XMMRegister src1, const Operand& src2,
+               int8_t offset);
+  void vpinsrd(XMMRegister dst, XMMRegister src1, Register src2,
+               int8_t offset) {
+    vpinsrd(dst, src1, Operand(src2), offset);
+  }
+  void vpinsrd(XMMRegister dst, XMMRegister src1, const Operand& src2,
+               int8_t offset);
+
+  void vcvtdq2ps(XMMRegister dst, XMMRegister src) {
+    vcvtdq2ps(dst, Operand(src));
+  }
+  void vcvtdq2ps(XMMRegister dst, const Operand& src) {
+    vinstr(0x5B, dst, xmm0, src, kNone, k0F, kWIG);
+  }
+  void vcvttps2dq(XMMRegister dst, XMMRegister src) {
+    vcvttps2dq(dst, Operand(src));
+  }
+  void vcvttps2dq(XMMRegister dst, const Operand& src) {
+    vinstr(0x5B, dst, xmm0, src, kF3, k0F, kWIG);
+  }
+
+  void vmovd(XMMRegister dst, Register src) { vmovd(dst, Operand(src)); }
+  void vmovd(XMMRegister dst, const Operand& src) {
+    vinstr(0x6E, dst, xmm0, src, k66, k0F, kWIG);
+  }
+  void vmovd(Register dst, XMMRegister src) { movd(Operand(dst), src); }
+  void vmovd(const Operand& dst, XMMRegister src) {
+    vinstr(0x7E, src, xmm0, dst, k66, k0F, kWIG);
+  }
 
   // BMI instruction
   void andn(Register dst, Register src1, Register src2) {
@@ -1438,6 +1591,23 @@ class Assembler : public AssemblerBase {
   void vpd(byte op, XMMRegister dst, XMMRegister src1, XMMRegister src2);
   void vpd(byte op, XMMRegister dst, XMMRegister src1, const Operand& src2);
 
+  void vcmpps(XMMRegister dst, XMMRegister src1, const Operand& src2,
+              int8_t cmp);
+#define AVX_CMP_P(instr, imm8)                                             \
+  void instr##ps(XMMRegister dst, XMMRegister src1, XMMRegister src2) {    \
+    vcmpps(dst, src1, Operand(src2), imm8);                                \
+  }                                                                        \
+  void instr##ps(XMMRegister dst, XMMRegister src1, const Operand& src2) { \
+    vcmpps(dst, src1, src2, imm8);                                         \
+  }
+
+  AVX_CMP_P(vcmpeq, 0x0);
+  AVX_CMP_P(vcmplt, 0x1);
+  AVX_CMP_P(vcmple, 0x2);
+  AVX_CMP_P(vcmpneq, 0x4);
+
+#undef AVX_CMP_P
+
 // Other SSE and AVX instructions
 #define DECLARE_SSE2_INSTRUCTION(instruction, prefix, escape, opcode) \
   void instruction(XMMRegister dst, XMMRegister src) {                \
@@ -1547,6 +1717,12 @@ class Assembler : public AssemblerBase {
     UNREACHABLE();
   }
 
+  // Patch the dummy heap number that we emitted at {pc} during code assembly
+  // with the actual heap object (handle).
+  static void set_heap_number(Handle<HeapObject> number, Address pc) {
+    Memory::Object_Handle_at(pc) = number;
+  }
+
  protected:
   void emit_sse_operand(XMMRegister reg, const Operand& adr);
   void emit_sse_operand(XMMRegister dst, XMMRegister src);
@@ -1568,12 +1744,8 @@ class Assembler : public AssemblerBase {
   void GrowBuffer();
   inline void emit(uint32_t x);
   inline void emit(Handle<Object> handle);
-  inline void emit(uint32_t x,
-                   RelocInfo::Mode rmode,
-                   TypeFeedbackId id = TypeFeedbackId::None());
-  inline void emit(Handle<Code> code,
-                   RelocInfo::Mode rmode,
-                   TypeFeedbackId id = TypeFeedbackId::None());
+  inline void emit(uint32_t x, RelocInfo::Mode rmode);
+  inline void emit(Handle<Code> code, RelocInfo::Mode rmode);
   inline void emit(const Immediate& x);
   inline void emit_b(Immediate x);
   inline void emit_w(const Immediate& x);

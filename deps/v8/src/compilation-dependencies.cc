@@ -22,7 +22,6 @@ DependentCode* CompilationDependencies::Get(Handle<Object> object) const {
     return Handle<AllocationSite>::cast(object)->dependent_code();
   }
   UNREACHABLE();
-  return nullptr;
 }
 
 
@@ -145,7 +144,7 @@ void CompilationDependencies::AssumeTransitionStable(
       site->SitePointsToLiteral()
           ? JSObject::cast(site->transition_info())->GetElementsKind()
           : site->GetElementsKind();
-  if (AllocationSite::GetMode(kind) == TRACK_ALLOCATION_SITE) {
+  if (AllocationSite::ShouldTrack(kind)) {
     Insert(DependentCode::kAllocationSiteTransitionChangedGroup, site);
   }
 }

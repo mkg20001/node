@@ -114,7 +114,6 @@ Address RelocInfo::target_address_address() {
 
 Address RelocInfo::constant_pool_entry_address() {
   UNREACHABLE();
-  return NULL;
 }
 
 int RelocInfo::target_address_size() { return Assembler::kSpecialTargetSize; }
@@ -300,22 +299,22 @@ template <typename ObjectVisitor>
 void RelocInfo::Visit(Isolate* isolate, ObjectVisitor* visitor) {
   RelocInfo::Mode mode = rmode();
   if (mode == RelocInfo::EMBEDDED_OBJECT) {
-    visitor->VisitEmbeddedPointer(this);
+    visitor->VisitEmbeddedPointer(host(), this);
   } else if (RelocInfo::IsCodeTarget(mode)) {
-    visitor->VisitCodeTarget(this);
+    visitor->VisitCodeTarget(host(), this);
   } else if (mode == RelocInfo::CELL) {
-    visitor->VisitCell(this);
+    visitor->VisitCellPointer(host(), this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
-    visitor->VisitExternalReference(this);
+    visitor->VisitExternalReference(host(), this);
   } else if (mode == RelocInfo::INTERNAL_REFERENCE) {
-    visitor->VisitInternalReference(this);
+    visitor->VisitInternalReference(host(), this);
   } else if (RelocInfo::IsCodeAgeSequence(mode)) {
-    visitor->VisitCodeAgeSequence(this);
+    visitor->VisitCodeAgeSequence(host(), this);
   } else if (RelocInfo::IsDebugBreakSlot(mode) &&
              IsPatchedDebugBreakSlotSequence()) {
-    visitor->VisitDebugTarget(this);
+    visitor->VisitDebugTarget(host(), this);
   } else if (IsRuntimeEntry(mode)) {
-    visitor->VisitRuntimeEntry(this);
+    visitor->VisitRuntimeEntry(host(), this);
   }
 }
 
@@ -372,15 +371,10 @@ void Assembler::CheckBuffer() {
   }
 }
 
-int32_t Assembler::emit_code_target(Handle<Code> target, RelocInfo::Mode rmode,
-                                    TypeFeedbackId ast_id) {
+int32_t Assembler::emit_code_target(Handle<Code> target,
+                                    RelocInfo::Mode rmode) {
   DCHECK(RelocInfo::IsCodeTarget(rmode));
-  if (rmode == RelocInfo::CODE_TARGET && !ast_id.IsNone()) {
-    SetRecordedAstId(ast_id);
-    RecordRelocInfo(RelocInfo::CODE_TARGET_WITH_ID);
-  } else {
-    RecordRelocInfo(rmode);
-  }
+  RecordRelocInfo(rmode);
 
   int current = code_targets_.length();
   if (current > 0 && code_targets_.last().is_identical_to(target)) {

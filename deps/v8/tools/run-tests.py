@@ -68,8 +68,10 @@ TEST_MAP = {
     "debugger",
     "mjsunit",
     "cctest",
+    "wasm-spec-tests",
     "inspector",
     "webkit",
+    "mkgrokdump",
     "fuzzer",
     "message",
     "preparser",
@@ -81,7 +83,9 @@ TEST_MAP = {
     "debugger",
     "mjsunit",
     "cctest",
+    "wasm-spec-tests",
     "inspector",
+    "mkgrokdump",
     "fuzzer",
     "message",
     "preparser",
@@ -105,12 +109,12 @@ TEST_MAP = {
 TIMEOUT_DEFAULT = 60
 
 # Variants ordered by expected runtime (slowest first).
-VARIANTS = ["default", "noturbofan"]
+VARIANTS = ["default"]
 
 MORE_VARIANTS = [
   "stress",
-  "noturbofan_stress",
   "nooptimization",
+  "fullcode",
   "asm_wasm",
   "wasm_traps",
 ]
@@ -122,8 +126,9 @@ VARIANT_ALIASES = {
   "dev": VARIANTS,
   # Additional variants, run on all bots.
   "more": MORE_VARIANTS,
+  # TODO(machenbach): Deprecate this after the step is removed on infra side.
   # Additional variants, run on a subset of bots.
-  "extra": ["fullcode"],
+  "extra": [],
 }
 
 DEBUG_FLAGS = ["--nohard-abort", "--nodead-code-elimination",
@@ -265,7 +270,7 @@ def BuildOptions():
                     default=False, action="store_true")
   result.add_option("--extra-flags",
                     help="Additional flags to pass to each test command",
-                    default="")
+                    action="append", default=[])
   result.add_option("--isolates", help="Whether to test isolates",
                     default=False, action="store_true")
   result.add_option("-j", help="The number of parallel tasks to run",
@@ -407,10 +412,6 @@ def SetupEnvironment(options):
     if not utils.GuessOS() == 'macos':
       # LSAN is not available on mac.
       asan_options.append('detect_leaks=1')
-      os.environ['LSAN_OPTIONS'] = ":".join([
-        'suppressions=%s' % os.path.join(
-            BASE_DIR, 'tools', 'memory', 'lsan', 'suppressions.txt'),
-      ])
     os.environ['ASAN_OPTIONS'] = ":".join(asan_options)
 
   if options.sancov_dir:
@@ -419,6 +420,7 @@ def SetupEnvironment(options):
       'coverage=1',
       'coverage_dir=%s' % options.sancov_dir,
       symbolizer,
+      "allow_user_segv_handler=1",
     ])
 
   if options.cfi_vptr:
@@ -532,7 +534,7 @@ def ProcessOptions(options):
           "running tests locally.")
     options.no_network = True
   options.command_prefix = shlex.split(options.command_prefix)
-  options.extra_flags = shlex.split(options.extra_flags)
+  options.extra_flags = sum(map(shlex.split, options.extra_flags), [])
 
   if options.gc_stress:
     options.extra_flags += GC_STRESS_FLAGS
@@ -781,7 +783,7 @@ def Execute(arch, mode, args, options, suites):
   # target_arch != v8_target_arch in the dumped build config.
   simulator_run = not options.dont_skip_simulator_slow_tests and \
       arch in ['arm64', 'arm', 'mipsel', 'mips', 'mips64', 'mips64el', \
-               'ppc', 'ppc64'] and \
+               'ppc', 'ppc64', 's390', 's390x'] and \
       ARCH_GUESS and arch != ARCH_GUESS
   # Find available test suites and read test cases from them.
   variables = {

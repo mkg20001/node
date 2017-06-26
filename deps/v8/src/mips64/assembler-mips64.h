@@ -361,6 +361,9 @@ constexpr DoubleRegister kDoubleRegZero = f28;
 // Used on mips64r6 for compare operations.
 // We use the last non-callee saved odd register for N64 ABI
 constexpr DoubleRegister kDoubleCompareReg = f23;
+// MSA zero and scratch regs must have the same numbers as FPU zero and scratch
+constexpr Simd128Register kSimd128RegZero = w28;
+constexpr Simd128Register kSimd128ScratchReg = w30;
 
 // FPU (coprocessor 1) control registers.
 // Currently only FCSR (#31) is implemented.
@@ -501,7 +504,7 @@ class Assembler : public AssemblerBase {
   // GetCode emits any pending (non-emitted) code and fills the descriptor
   // desc. GetCode() is idempotent; it returns the same result if no other
   // Assembler functions are invoked in between GetCode() calls.
-  void GetCode(CodeDesc* desc);
+  void GetCode(Isolate* isolate, CodeDesc* desc);
 
   // Label operations & relative jumps (PPUM Appendix D).
   //
@@ -589,6 +592,10 @@ class Assembler : public AssemblerBase {
   // Return the code target address at a call site from the return address
   // of that call in the instruction stream.
   inline static Address target_address_from_return_address(Address pc);
+
+  static void set_heap_number(Handle<HeapObject> number, Address pc) {
+    UNIMPLEMENTED();
+  }
 
   static void JumpLabelToJumpRegister(Address pc);
 
@@ -1002,9 +1009,11 @@ class Assembler : public AssemblerBase {
   void ins_(Register rt, Register rs, uint16_t pos, uint16_t size);
   void ext_(Register rt, Register rs, uint16_t pos, uint16_t size);
   void dext_(Register rt, Register rs, uint16_t pos, uint16_t size);
-  void dextm(Register rt, Register rs, uint16_t pos, uint16_t size);
-  void dextu(Register rt, Register rs, uint16_t pos, uint16_t size);
+  void dextm_(Register rt, Register rs, uint16_t pos, uint16_t size);
+  void dextu_(Register rt, Register rs, uint16_t pos, uint16_t size);
   void dins_(Register rt, Register rs, uint16_t pos, uint16_t size);
+  void dinsm_(Register rt, Register rs, uint16_t pos, uint16_t size);
+  void dinsu_(Register rt, Register rs, uint16_t pos, uint16_t size);
   void bitswap(Register rd, Register rt);
   void dbitswap(Register rd, Register rt);
   void align(Register rd, Register rs, Register rt, uint8_t bp);
@@ -1150,15 +1159,45 @@ class Assembler : public AssemblerBase {
 
   // MSA instructions
   void bz_v(MSARegister wt, int16_t offset);
+  inline void bz_v(MSARegister wt, Label* L) {
+    bz_v(wt, shifted_branch_offset(L));
+  }
   void bz_b(MSARegister wt, int16_t offset);
+  inline void bz_b(MSARegister wt, Label* L) {
+    bz_b(wt, shifted_branch_offset(L));
+  }
   void bz_h(MSARegister wt, int16_t offset);
+  inline void bz_h(MSARegister wt, Label* L) {
+    bz_h(wt, shifted_branch_offset(L));
+  }
   void bz_w(MSARegister wt, int16_t offset);
+  inline void bz_w(MSARegister wt, Label* L) {
+    bz_w(wt, shifted_branch_offset(L));
+  }
   void bz_d(MSARegister wt, int16_t offset);
+  inline void bz_d(MSARegister wt, Label* L) {
+    bz_d(wt, shifted_branch_offset(L));
+  }
   void bnz_v(MSARegister wt, int16_t offset);
+  inline void bnz_v(MSARegister wt, Label* L) {
+    bnz_v(wt, shifted_branch_offset(L));
+  }
   void bnz_b(MSARegister wt, int16_t offset);
+  inline void bnz_b(MSARegister wt, Label* L) {
+    bnz_b(wt, shifted_branch_offset(L));
+  }
   void bnz_h(MSARegister wt, int16_t offset);
+  inline void bnz_h(MSARegister wt, Label* L) {
+    bnz_h(wt, shifted_branch_offset(L));
+  }
   void bnz_w(MSARegister wt, int16_t offset);
+  inline void bnz_w(MSARegister wt, Label* L) {
+    bnz_w(wt, shifted_branch_offset(L));
+  }
   void bnz_d(MSARegister wt, int16_t offset);
+  inline void bnz_d(MSARegister wt, Label* L) {
+    bnz_d(wt, shifted_branch_offset(L));
+  }
 
   void ld_b(MSARegister wd, const MemOperand& rs);
   void ld_h(MSARegister wd, const MemOperand& rs);
@@ -1758,20 +1797,6 @@ class Assembler : public AssemblerBase {
   // Mark address of a debug break slot.
   void RecordDebugBreakSlot(RelocInfo::Mode mode);
 
-  // Record the AST id of the CallIC being compiled, so that it can be placed
-  // in the relocation information.
-  void SetRecordedAstId(TypeFeedbackId ast_id) {
-    DCHECK(recorded_ast_id_.IsNone());
-    recorded_ast_id_ = ast_id;
-  }
-
-  TypeFeedbackId RecordedAstId() {
-    DCHECK(!recorded_ast_id_.IsNone());
-    return recorded_ast_id_;
-  }
-
-  void ClearRecordedAstId() { recorded_ast_id_ = TypeFeedbackId::None(); }
-
   // Record a comment relocation entry that can be used by a disassembler.
   // Use --code-comments to enable.
   void RecordComment(const char* msg);
@@ -1818,6 +1843,7 @@ class Assembler : public AssemblerBase {
 
   // Check if an instruction is a branch of some kind.
   static bool IsBranch(Instr instr);
+  static bool IsMsaBranch(Instr instr);
   static bool IsBc(Instr instr);
   static bool IsBzc(Instr instr);
 
@@ -1898,12 +1924,6 @@ class Assembler : public AssemblerBase {
 
   // Helpers.
   void LoadRegPlusOffsetToAt(const MemOperand& src);
-  int32_t LoadRegPlusUpperOffsetPartToAt(const MemOperand& src);
-
-  // Relocation for a type-recording IC has the AST id added to it.  This
-  // member variable is a way to pass the information from the call site to
-  // the relocation info.
-  TypeFeedbackId recorded_ast_id_;
 
   inline static void set_target_internal_reference_encoded_at(Address pc,
                                                               Address target);
@@ -1974,6 +1994,9 @@ class Assembler : public AssemblerBase {
   inline void CheckTrampolinePoolQuick(int extra_instructions = 0);
 
  private:
+  // Avoid overflows for displacements etc.
+  static const int kMaximalBufferSize = 512 * MB;
+
   // Buffer size and constant pool distance are checked together at regular
   // intervals of kBufferCheckInterval emitted bytes.
   static constexpr int kBufferCheckInterval = 1 * KB / 2;

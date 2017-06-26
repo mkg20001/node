@@ -289,10 +289,10 @@ TEST(GetScriptLineNumber) {
 
 
 TEST(FeedbackVectorPreservedAcrossRecompiles) {
-  if (i::FLAG_always_opt || !i::FLAG_crankshaft) return;
+  if (i::FLAG_always_opt || !i::FLAG_opt) return;
   i::FLAG_allow_natives_syntax = true;
   CcTest::InitializeVM();
-  if (!CcTest::i_isolate()->use_crankshaft()) return;
+  if (!CcTest::i_isolate()->use_optimizer()) return;
   v8::HandleScope scope(CcTest::isolate());
   v8::Local<v8::Context> context = CcTest::isolate()->GetCurrentContext();
 
@@ -305,12 +305,8 @@ TEST(FeedbackVectorPreservedAcrossRecompiles) {
       v8::Utils::OpenHandle(*v8::Local<v8::Function>::Cast(
           CcTest::global()->Get(context, v8_str("f")).ToLocalChecked())));
 
-  // We shouldn't have deoptimization support. We want to recompile and
-  // verify that our feedback vector preserves information.
-  CHECK(!f->shared()->has_deoptimization_support());
-  Handle<FeedbackVector> feedback_vector(f->feedback_vector());
-
   // Verify that we gathered feedback.
+  Handle<FeedbackVector> feedback_vector(f->feedback_vector());
   CHECK(!feedback_vector->is_empty());
   FeedbackSlot slot_for_a(0);
   Object* object = feedback_vector->Get(slot_for_a);
@@ -322,11 +318,6 @@ TEST(FeedbackVectorPreservedAcrossRecompiles) {
   // Verify that the feedback is still "gathered" despite a recompilation
   // of the full code.
   CHECK(f->IsOptimized());
-  // If the baseline code is bytecode, then it will not have deoptimization
-  // support. The has_deoptimization_support() check is only required if the
-  // baseline code is from fullcodegen.
-  CHECK(f->shared()->has_deoptimization_support() || i::FLAG_ignition ||
-        i::FLAG_turbo);
   object = f->feedback_vector()->Get(slot_for_a);
   CHECK(object->IsWeakCell() &&
         WeakCell::cast(object)->value()->IsJSFunction());
@@ -402,8 +393,8 @@ TEST(OptimizedCodeSharing1) {
             env->Global()
                 ->Get(env.local(), v8_str("closure2"))
                 .ToLocalChecked())));
-    CHECK(fun1->IsOptimized() || !CcTest::i_isolate()->use_crankshaft());
-    CHECK(fun2->IsOptimized() || !CcTest::i_isolate()->use_crankshaft());
+    CHECK(fun1->IsOptimized() || !CcTest::i_isolate()->use_optimizer());
+    CHECK(fun2->IsOptimized() || !CcTest::i_isolate()->use_optimizer());
     CHECK_EQ(fun1->code(), fun2->code());
   }
 }

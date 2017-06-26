@@ -172,7 +172,8 @@ DebugEvaluate::ContextBuilder::ContextBuilder(Isolate* isolate,
       evaluation_context_ = outer_context;
       break;
     } else if (scope_type == ScopeIterator::ScopeTypeCatch ||
-               scope_type == ScopeIterator::ScopeTypeWith) {
+               scope_type == ScopeIterator::ScopeTypeWith ||
+               scope_type == ScopeIterator::ScopeTypeModule) {
       ContextChainElement context_chain_element;
       Handle<Context> current_context = it.CurrentContext();
       if (!current_context->IsDebugEvaluateContext()) {
@@ -260,58 +261,90 @@ namespace {
 
 bool IntrinsicHasNoSideEffect(Runtime::FunctionId id) {
 // Use macro to include both inlined and non-inlined version of an intrinsic.
-#define INTRINSIC_WHITELIST(V)      \
-  /* Conversions */                 \
-  V(ToInteger)                      \
-  V(ToObject)                       \
-  V(ToString)                       \
-  V(ToLength)                       \
-  V(ToNumber)                       \
-  /* Type checks */                 \
-  V(IsJSReceiver)                   \
-  V(IsSmi)                          \
-  V(IsArray)                        \
-  V(IsFunction)                     \
-  V(IsDate)                         \
-  V(IsJSProxy)                      \
-  V(IsRegExp)                       \
-  V(IsTypedArray)                   \
-  V(ClassOf)                        \
-  /* Loads */                       \
-  V(LoadLookupSlotForCall)          \
-  /* Arrays */                      \
-  V(ArraySpeciesConstructor)        \
-  V(NormalizeElements)              \
-  V(GetArrayKeys)                   \
-  V(HasComplexElements)             \
-  V(EstimateNumberOfElements)       \
-  /* Errors */                      \
-  V(ReThrow)                        \
-  V(ThrowReferenceError)            \
-  V(ThrowSymbolIteratorInvalid)     \
-  V(ThrowIteratorResultNotAnObject) \
-  V(NewTypeError)                   \
-  /* Strings */                     \
-  V(StringCharCodeAt)               \
-  V(StringIndexOf)                  \
-  V(StringReplaceOneCharWithString) \
-  V(SubString)                      \
-  V(RegExpInternalReplace)          \
-  /* Literals */                    \
-  V(CreateArrayLiteral)             \
-  V(CreateObjectLiteral)            \
-  V(CreateRegExpLiteral)            \
-  /* Collections */                 \
-  V(JSCollectionGetTable)           \
-  V(FixedArrayGet)                  \
-  V(StringGetRawHashField)          \
-  V(GenericHash)                    \
-  V(MapIteratorInitialize)          \
-  V(MapInitialize)                  \
-  /* Misc. */                       \
-  V(ForInPrepare)                   \
-  V(Call)                           \
-  V(MaxSmi)                         \
+#define INTRINSIC_WHITELIST(V)       \
+  /* Conversions */                  \
+  V(ToInteger)                       \
+  V(ToObject)                        \
+  V(ToString)                        \
+  V(ToLength)                        \
+  V(ToNumber)                        \
+  /* Type checks */                  \
+  V(IsJSReceiver)                    \
+  V(IsSmi)                           \
+  V(IsArray)                         \
+  V(IsFunction)                      \
+  V(IsDate)                          \
+  V(IsJSProxy)                       \
+  V(IsJSMap)                         \
+  V(IsJSSet)                         \
+  V(IsJSMapIterator)                 \
+  V(IsJSSetIterator)                 \
+  V(IsJSWeakMap)                     \
+  V(IsJSWeakSet)                     \
+  V(IsRegExp)                        \
+  V(IsTypedArray)                    \
+  V(ClassOf)                         \
+  /* Loads */                        \
+  V(LoadLookupSlotForCall)           \
+  /* Arrays */                       \
+  V(ArraySpeciesConstructor)         \
+  V(NormalizeElements)               \
+  V(GetArrayKeys)                    \
+  V(HasComplexElements)              \
+  V(EstimateNumberOfElements)        \
+  /* Errors */                       \
+  V(ReThrow)                         \
+  V(ThrowReferenceError)             \
+  V(ThrowSymbolIteratorInvalid)      \
+  V(ThrowIteratorResultNotAnObject)  \
+  V(NewTypeError)                    \
+  /* Strings */                      \
+  V(StringCharCodeAt)                \
+  V(StringIndexOf)                   \
+  V(StringReplaceOneCharWithString)  \
+  V(SubString)                       \
+  V(RegExpInternalReplace)           \
+  /* Literals */                     \
+  V(CreateArrayLiteral)              \
+  V(CreateObjectLiteral)             \
+  V(CreateRegExpLiteral)             \
+  /* Collections */                  \
+  V(JSCollectionGetTable)            \
+  V(FixedArrayGet)                   \
+  V(StringGetRawHashField)           \
+  V(GenericHash)                     \
+  V(MapIteratorInitialize)           \
+  V(MapInitialize)                   \
+  V(SetInitialize)                   \
+  /* Called from builtins */         \
+  V(StringParseFloat)                \
+  V(StringParseInt)                  \
+  V(StringCharCodeAtRT)              \
+  V(StringIndexOfUnchecked)          \
+  V(StringEqual)                     \
+  V(SymbolDescriptiveString)         \
+  V(GenerateRandomNumbers)           \
+  V(ExternalStringGetChar)           \
+  V(GlobalPrint)                     \
+  V(AllocateInNewSpace)              \
+  V(AllocateSeqOneByteString)        \
+  V(AllocateSeqTwoByteString)        \
+  V(ObjectCreate)                    \
+  V(ObjectHasOwnProperty)            \
+  V(ArrayIndexOf)                    \
+  V(ArrayIncludes_Slow)              \
+  V(ArrayIsArray)                    \
+  V(ThrowTypeError)                  \
+  V(ThrowCalledOnNullOrUndefined)    \
+  V(ThrowIncompatibleMethodReceiver) \
+  V(ThrowInvalidHint)                \
+  V(ThrowNotDateError)               \
+  /* Misc. */                        \
+  V(ForInPrepare)                    \
+  V(Call)                            \
+  V(MaxSmi)                          \
+  V(NewObject)                       \
+  V(FinalizeInstanceSize)            \
   V(HasInPrototypeChain)
 
 #define CASE(Name)       \
@@ -408,12 +441,16 @@ bool BytecodeHasNoSideEffect(interpreter::Bytecode bytecode) {
     case Bytecode::kToNumber:
     case Bytecode::kToName:
     // Misc.
+    case Bytecode::kStringConcat:
     case Bytecode::kForInPrepare:
     case Bytecode::kForInContinue:
     case Bytecode::kForInNext:
     case Bytecode::kForInStep:
     case Bytecode::kThrow:
     case Bytecode::kReThrow:
+    case Bytecode::kThrowReferenceErrorIfHole:
+    case Bytecode::kThrowSuperNotCalledIfHole:
+    case Bytecode::kThrowSuperAlreadyCalledIfNotHole:
     case Bytecode::kIllegal:
     case Bytecode::kCallJSRuntime:
     case Bytecode::kStackCheck:
@@ -447,6 +484,7 @@ bool BuiltinHasNoSideEffect(Builtins::Name id) {
     case Builtins::kObjectPrototypeValueOf:
     case Builtins::kObjectValues:
     case Builtins::kObjectHasOwnProperty:
+    case Builtins::kObjectPrototypeIsPrototypeOf:
     case Builtins::kObjectPrototypePropertyIsEnumerable:
     case Builtins::kObjectProtoToString:
     // Array builtins.
@@ -496,6 +534,10 @@ bool BuiltinHasNoSideEffect(Builtins::Name id) {
     case Builtins::kDatePrototypeToJson:
     case Builtins::kDatePrototypeToPrimitive:
     case Builtins::kDatePrototypeValueOf:
+    // Map builtins.
+    case Builtins::kMapConstructor:
+    case Builtins::kMapGet:
+    case Builtins::kMapGetSize:
     // Math builtins.
     case Builtins::kMathAbs:
     case Builtins::kMathAcos:
@@ -545,6 +587,9 @@ bool BuiltinHasNoSideEffect(Builtins::Name id) {
     case Builtins::kNumberPrototypeToPrecision:
     case Builtins::kNumberPrototypeToString:
     case Builtins::kNumberPrototypeValueOf:
+    // Set builtins.
+    case Builtins::kSetConstructor:
+    case Builtins::kSetGetSize:
     // String builtins. Strings are immutable.
     case Builtins::kStringFromCharCode:
     case Builtins::kStringFromCodePoint:
@@ -556,6 +601,7 @@ bool BuiltinHasNoSideEffect(Builtins::Name id) {
     case Builtins::kStringPrototypeIncludes:
     case Builtins::kStringPrototypeIndexOf:
     case Builtins::kStringPrototypeLastIndexOf:
+    case Builtins::kStringPrototypeSlice:
     case Builtins::kStringPrototypeStartsWith:
     case Builtins::kStringPrototypeSubstr:
     case Builtins::kStringPrototypeSubstring:
@@ -649,6 +695,23 @@ bool DebugEvaluate::FunctionHasNoSideEffect(Handle<SharedFunctionInfo> info) {
     int builtin_index = info->code()->builtin_index();
     if (builtin_index >= 0 && builtin_index < Builtins::builtin_count &&
         BuiltinHasNoSideEffect(static_cast<Builtins::Name>(builtin_index))) {
+#ifdef DEBUG
+      // TODO(yangguo): Check builtin-to-builtin calls too.
+      int mode = RelocInfo::ModeMask(RelocInfo::EXTERNAL_REFERENCE);
+      bool failed = false;
+      for (RelocIterator it(info->code(), mode); !it.done(); it.next()) {
+        RelocInfo* rinfo = it.rinfo();
+        Address address = rinfo->target_external_reference();
+        const Runtime::Function* function = Runtime::FunctionForEntry(address);
+        if (function == nullptr) continue;
+        if (!IntrinsicHasNoSideEffect(function->function_id)) {
+          PrintF("Whitelisted builtin %s calls non-whitelisted intrinsic %s\n",
+                 Builtins::name(builtin_index), function->name);
+          failed = true;
+        }
+        CHECK(!failed);
+      }
+#endif  // DEBUG
       return true;
     }
   }

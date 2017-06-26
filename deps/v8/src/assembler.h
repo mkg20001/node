@@ -35,11 +35,12 @@
 #ifndef V8_ASSEMBLER_H_
 #define V8_ASSEMBLER_H_
 
+#include <forward_list>
+
 #include "src/allocation.h"
 #include "src/builtins/builtins.h"
 #include "src/deoptimize-reason.h"
 #include "src/globals.h"
-#include "src/isolate.h"
 #include "src/label.h"
 #include "src/log.h"
 #include "src/register-configuration.h"
@@ -53,6 +54,7 @@ class ApiFunction;
 namespace internal {
 
 // Forward declarations.
+class Isolate;
 class SourcePosition;
 class StatsCounter;
 
@@ -69,9 +71,7 @@ class AssemblerBase: public Malloced {
     IsolateData(const IsolateData&) = default;
 
     bool serializer_enabled_;
-#if V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_X64
     size_t max_old_generation_size_;
-#endif
 #if V8_TARGET_ARCH_X64
     Address code_range_start_;
 #endif
@@ -110,7 +110,6 @@ class AssemblerBase: public Malloced {
     } else {
       // Embedded constant pool not supported on this architecture.
       UNREACHABLE();
-      return false;
     }
   }
 
@@ -150,6 +149,17 @@ class AssemblerBase: public Malloced {
   // The program counter, which points into the buffer above and moves forward.
   byte* pc_;
 
+  // The following two functions help with avoiding allocations of heap numbers
+  // during the code assembly phase. {RequestHeapNumber} records the need for a
+  // future heap number allocation, together with the current pc offset. After
+  // code assembly, {AllocateRequestedHeapNumbers} will allocate these numbers
+  // and, with the help of {Assembler::set_heap_number}, place them where they
+  // are expected (determined by the recorded pc offset).
+  void RequestHeapNumber(double value) {
+    heap_numbers_.emplace_front(value, pc_offset());
+  }
+  void AllocateRequestedHeapNumbers(Isolate* isolate);
+
  private:
   IsolateData isolate_data_;
   uint64_t enabled_cpu_features_;
@@ -163,6 +173,16 @@ class AssemblerBase: public Malloced {
   // Constant pool.
   friend class FrameAndConstantPoolScope;
   friend class ConstantPoolUnavailableScope;
+
+  // Delayed allocation of heap numbers.
+  struct RequestedHeapNumber {
+    RequestedHeapNumber(double value, int offset);
+    double value;  // The number for which we later need to create a HeapObject.
+    int offset;  // The {buffer_} offset where we emitted a dummy that needs to
+                 // get replaced by the actual HeapObject via
+                 // {Assembler::set_heap_number}.
+  };
+  std::forward_list<RequestedHeapNumber> heap_numbers_;
 };
 
 
@@ -325,10 +345,11 @@ class RelocInfo {
 
   enum Mode {
     // Please note the order is important (see IsCodeTarget, IsGCRelocMode).
-    CODE_TARGET,  // Code target which is not any of the above.
-    CODE_TARGET_WITH_ID,
+    CODE_TARGET,
     EMBEDDED_OBJECT,
-    // To relocate pointers into the wasm memory embedded in wasm code
+    // Wasm entries are to relocate pointers into the wasm memory embedded in
+    // wasm code. Everything after WASM_MEMORY_REFERENCE (inclusive) is not
+    // GC'ed.
     WASM_MEMORY_REFERENCE,
     WASM_GLOBAL_REFERENCE,
     WASM_MEMORY_SIZE_REFERENCE,
@@ -336,7 +357,6 @@ class RelocInfo {
     WASM_PROTECTED_INSTRUCTION_LANDING,
     CELL,
 
-    // Everything after runtime_entry (inclusive) is not GC'ed.
     RUNTIME_ENTRY,
     COMMENT,
 
@@ -375,8 +395,8 @@ class RelocInfo {
 
     FIRST_REAL_RELOC_MODE = CODE_TARGET,
     LAST_REAL_RELOC_MODE = VENEER_POOL,
-    LAST_CODE_ENUM = CODE_TARGET_WITH_ID,
-    LAST_GCED_ENUM = WASM_FUNCTION_TABLE_SIZE_REFERENCE,
+    LAST_CODE_ENUM = CODE_TARGET,
+    LAST_GCED_ENUM = EMBEDDED_OBJECT,
     FIRST_SHAREABLE_RELOC_MODE = CELL,
   };
 
@@ -621,7 +641,6 @@ class RelocInfo {
 #endif
 
   static const int kCodeTargetMask = (1 << (LAST_CODE_ENUM + 1)) - 1;
-  static const int kDataMask = (1 << CODE_TARGET_WITH_ID) | (1 << COMMENT);
   static const int kDebugBreakSlotMask = 1 << DEBUG_BREAK_SLOT_AT_POSITION |
                                          1 << DEBUG_BREAK_SLOT_AT_RETURN |
                                          1 << DEBUG_BREAK_SLOT_AT_CALL;
@@ -649,8 +668,8 @@ class RelocInfo {
 // lower addresses.
 class RelocInfoWriter BASE_EMBEDDED {
  public:
-  RelocInfoWriter() : pos_(NULL), last_pc_(NULL), last_id_(0) {}
-  RelocInfoWriter(byte* pos, byte* pc) : pos_(pos), last_pc_(pc), last_id_(0) {}
+  RelocInfoWriter() : pos_(NULL), last_pc_(NULL) {}
+  RelocInfoWriter(byte* pos, byte* pc) : pos_(pos), last_pc_(pc) {}
 
   byte* pos() const { return pos_; }
   byte* last_pc() const { return last_pc_; }
@@ -675,7 +694,7 @@ class RelocInfoWriter BASE_EMBEDDED {
   inline uint32_t WriteLongPCJump(uint32_t pc_delta);
 
   inline void WriteShortTaggedPC(uint32_t pc_delta, int tag);
-  inline void WriteShortTaggedData(intptr_t data_delta, int tag);
+  inline void WriteShortData(intptr_t data_delta);
 
   inline void WriteMode(RelocInfo::Mode rmode);
   inline void WriteModeAndPC(uint32_t pc_delta, RelocInfo::Mode rmode);
@@ -684,7 +703,6 @@ class RelocInfoWriter BASE_EMBEDDED {
 
   byte* pos_;
   byte* last_pc_;
-  int last_id_;
   RelocInfo::Mode last_mode_;
 
   DISALLOW_COPY_AND_ASSIGN(RelocInfoWriter);
@@ -728,13 +746,10 @@ class RelocIterator: public Malloced {
 
   void AdvanceReadLongPCJump();
 
-  int GetShortDataTypeTag();
   void ReadShortTaggedPC();
-  void ReadShortTaggedId();
-  void ReadShortTaggedData();
+  void ReadShortData();
 
   void AdvanceReadPC();
-  void AdvanceReadId();
   void AdvanceReadInt();
   void AdvanceReadData();
 
@@ -750,7 +765,6 @@ class RelocIterator: public Malloced {
   RelocInfo rinfo_;
   bool done_;
   int mode_mask_;
-  int last_id_;
   DISALLOW_COPY_AND_ASSIGN(RelocIterator);
 };
 
@@ -820,6 +834,7 @@ class ExternalReference BASE_EMBEDDED {
 
   static void SetUp();
 
+  // These functions must use the isolate in a thread-safe way.
   typedef void* ExternalReferenceRedirector(Isolate* isolate, void* original,
                                             Type type);
 
@@ -837,7 +852,7 @@ class ExternalReference BASE_EMBEDDED {
 
   explicit ExternalReference(StatsCounter* counter);
 
-  ExternalReference(Isolate::AddressId id, Isolate* isolate);
+  ExternalReference(IsolateAddressId id, Isolate* isolate);
 
   explicit ExternalReference(const SCTableReference& table_ref);
 
@@ -990,7 +1005,23 @@ class ExternalReference BASE_EMBEDDED {
 
   static ExternalReference libc_memchr_function(Isolate* isolate);
   static ExternalReference libc_memcpy_function(Isolate* isolate);
+  static ExternalReference libc_memmove_function(Isolate* isolate);
   static ExternalReference libc_memset_function(Isolate* isolate);
+
+  static ExternalReference try_internalize_string_function(Isolate* isolate);
+
+#ifdef V8_INTL_SUPPORT
+  static ExternalReference intl_convert_one_byte_to_lower(Isolate* isolate);
+  static ExternalReference intl_to_latin1_lower_table(Isolate* isolate);
+#endif  // V8_INTL_SUPPORT
+
+  template <typename SubjectChar, typename PatternChar>
+  static ExternalReference search_string_raw(Isolate* isolate);
+
+  static ExternalReference orderedhashmap_get_raw(Isolate* isolate);
+
+  template <typename CollectionType, int entrysize>
+  static ExternalReference orderedhashtable_has_raw(Isolate* isolate);
 
   static ExternalReference page_flags(Page* page);
 
@@ -1047,12 +1078,7 @@ class ExternalReference BASE_EMBEDDED {
   // This lets you register a function that rewrites all external references.
   // Used by the ARM simulator to catch calls to external references.
   static void set_redirector(Isolate* isolate,
-                             ExternalReferenceRedirector* redirector) {
-    // We can't stack them.
-    DCHECK(isolate->external_reference_redirector() == NULL);
-    isolate->set_external_reference_redirector(
-        reinterpret_cast<ExternalReferenceRedirectorPointer*>(redirector));
-  }
+                             ExternalReferenceRedirector* redirector);
 
   static ExternalReference stress_deopt_count(Isolate* isolate);
 
@@ -1157,6 +1183,7 @@ class ConstantPoolEntry {
     return merged_index_;
   }
   void set_merged_index(int index) {
+    DCHECK(sharing_ok());
     merged_index_ = index;
     DCHECK(is_merged());
   }

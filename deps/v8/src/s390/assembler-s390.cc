@@ -339,16 +339,14 @@ MemOperand::MemOperand(Register rx, Register rb, int32_t offset) {
 
 Assembler::Assembler(IsolateData isolate_data, void* buffer, int buffer_size)
     : AssemblerBase(isolate_data, buffer, buffer_size),
-      recorded_ast_id_(TypeFeedbackId::None()),
       code_targets_(100) {
   reloc_info_writer.Reposition(buffer_ + buffer_size_, pc_);
 
   last_bound_pos_ = 0;
-  ClearRecordedAstId();
   relocations_.reserve(128);
 }
 
-void Assembler::GetCode(CodeDesc* desc) {
+void Assembler::GetCode(Isolate* isloate, CodeDesc* desc) {
   EmitRelocations();
 
   // Set up code descriptor.
@@ -1815,11 +1813,10 @@ void Assembler::srdl(Register r1, const Operand& opnd) {
   rs_form(SRDL, r1, r0, r0, opnd.immediate());
 }
 
-void Assembler::call(Handle<Code> target, RelocInfo::Mode rmode,
-                     TypeFeedbackId ast_id) {
+void Assembler::call(Handle<Code> target, RelocInfo::Mode rmode) {
   EnsureSpace ensure_space(this);
 
-  int32_t target_index = emit_code_target(target, rmode, ast_id);
+  int32_t target_index = emit_code_target(target, rmode);
   brasl(r14, Operand(target_index));
 }
 
@@ -2101,7 +2098,14 @@ void Assembler::GrowBuffer(int needed) {
   if (space < needed) {
     desc.buffer_size += needed - space;
   }
-  CHECK_GT(desc.buffer_size, 0);  // no overflow
+
+  // Some internal data structures overflow for very large buffers,
+  // they must ensure that kMaximalBufferSize is not too large.
+  if (desc.buffer_size > kMaximalBufferSize ||
+      static_cast<size_t>(desc.buffer_size) >
+          isolate_data().max_old_generation_size_) {
+    V8::FatalProcessOutOfMemory("Assembler::GrowBuffer");
+  }
 
   // Set up new buffer.
   desc.buffer = NewArray<byte>(desc.buffer_size);
@@ -2161,10 +2165,6 @@ void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
       (rmode == RelocInfo::EXTERNAL_REFERENCE && !serializer_enabled() &&
        !emit_debug_code())) {
     return;
-  }
-  if (rmode == RelocInfo::CODE_TARGET_WITH_ID) {
-    data = RecordedAstId().ToInt();
-    ClearRecordedAstId();
   }
   DeferredRelocInfo rinfo(pc_offset(), rmode, data);
   relocations_.push_back(rinfo);

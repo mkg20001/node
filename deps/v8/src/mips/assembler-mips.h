@@ -356,6 +356,9 @@ constexpr DoubleRegister kLithiumScratchDouble = f30;
 constexpr DoubleRegister kDoubleRegZero = f28;
 // Used on mips32r6 for compare operations.
 constexpr DoubleRegister kDoubleCompareReg = f26;
+// MSA zero and scratch regs must have the same numbers as FPU zero and scratch
+constexpr Simd128Register kSimd128RegZero = w28;
+constexpr Simd128Register kSimd128ScratchReg = w30;
 
 // FPU (coprocessor 1) control registers.
 // Currently only FCSR (#31) is implemented.
@@ -436,6 +439,8 @@ class Operand BASE_EMBEDDED {
 
   Register rm() const { return rm_; }
 
+  RelocInfo::Mode rmode() const { return rmode_; }
+
  private:
   Register rm_;
   int32_t imm32_;  // Valid if rm_ == no_reg.
@@ -495,7 +500,7 @@ class Assembler : public AssemblerBase {
   // GetCode emits any pending (non-emitted) code and fills the descriptor
   // desc. GetCode() is idempotent; it returns the same result if no other
   // Assembler functions are invoked in between GetCode() calls.
-  void GetCode(CodeDesc* desc);
+  void GetCode(Isolate* isolate, CodeDesc* desc);
 
   // Label operations & relative jumps (PPUM Appendix D).
   //
@@ -583,6 +588,10 @@ class Assembler : public AssemblerBase {
   // of that call in the instruction stream.
   inline static Address target_address_from_return_address(Address pc);
 
+  static void set_heap_number(Handle<HeapObject> number, Address pc) {
+    UNIMPLEMENTED();
+  }
+
   static void QuietNaN(HeapObject* nan);
 
   // This sets the branch destination (which gets loaded at the call address).
@@ -591,10 +600,19 @@ class Assembler : public AssemblerBase {
   inline static void deserialization_set_special_target_at(
       Isolate* isolate, Address instruction_payload, Code* code,
       Address target) {
-    set_target_address_at(
-        isolate,
-        instruction_payload - kInstructionsFor32BitConstant * kInstrSize, code,
-        target);
+    if (IsMipsArchVariant(kMips32r6)) {
+      // On R6 the address location is shifted by one instruction
+      set_target_address_at(
+          isolate,
+          instruction_payload -
+              (kInstructionsFor32BitConstant - 1) * kInstrSize,
+          code, target);
+    } else {
+      set_target_address_at(
+          isolate,
+          instruction_payload - kInstructionsFor32BitConstant * kInstrSize,
+          code, target);
+    }
   }
 
   // This sets the internal reference at the pc.
@@ -625,7 +643,7 @@ class Assembler : public AssemblerBase {
   // Distance between the instruction referring to the address of the call
   // target and the return address.
 #ifdef _MIPS_ARCH_MIPS32R6
-  static constexpr int kCallTargetAddressOffset = 3 * kInstrSize;
+  static constexpr int kCallTargetAddressOffset = 2 * kInstrSize;
 #else
   static constexpr int kCallTargetAddressOffset = 4 * kInstrSize;
 #endif
@@ -1086,15 +1104,45 @@ class Assembler : public AssemblerBase {
 
   // MSA instructions
   void bz_v(MSARegister wt, int16_t offset);
+  inline void bz_v(MSARegister wt, Label* L) {
+    bz_v(wt, shifted_branch_offset(L));
+  }
   void bz_b(MSARegister wt, int16_t offset);
+  inline void bz_b(MSARegister wt, Label* L) {
+    bz_b(wt, shifted_branch_offset(L));
+  }
   void bz_h(MSARegister wt, int16_t offset);
+  inline void bz_h(MSARegister wt, Label* L) {
+    bz_h(wt, shifted_branch_offset(L));
+  }
   void bz_w(MSARegister wt, int16_t offset);
+  inline void bz_w(MSARegister wt, Label* L) {
+    bz_w(wt, shifted_branch_offset(L));
+  }
   void bz_d(MSARegister wt, int16_t offset);
+  inline void bz_d(MSARegister wt, Label* L) {
+    bz_d(wt, shifted_branch_offset(L));
+  }
   void bnz_v(MSARegister wt, int16_t offset);
+  inline void bnz_v(MSARegister wt, Label* L) {
+    bnz_v(wt, shifted_branch_offset(L));
+  }
   void bnz_b(MSARegister wt, int16_t offset);
+  inline void bnz_b(MSARegister wt, Label* L) {
+    bnz_b(wt, shifted_branch_offset(L));
+  }
   void bnz_h(MSARegister wt, int16_t offset);
+  inline void bnz_h(MSARegister wt, Label* L) {
+    bnz_h(wt, shifted_branch_offset(L));
+  }
   void bnz_w(MSARegister wt, int16_t offset);
+  inline void bnz_w(MSARegister wt, Label* L) {
+    bnz_w(wt, shifted_branch_offset(L));
+  }
   void bnz_d(MSARegister wt, int16_t offset);
+  inline void bnz_d(MSARegister wt, Label* L) {
+    bnz_d(wt, shifted_branch_offset(L));
+  }
 
   void ld_b(MSARegister wd, const MemOperand& rs);
   void ld_h(MSARegister wd, const MemOperand& rs);
@@ -1691,20 +1739,6 @@ class Assembler : public AssemblerBase {
   // Mark address of a debug break slot.
   void RecordDebugBreakSlot(RelocInfo::Mode mode);
 
-  // Record the AST id of the CallIC being compiled, so that it can be placed
-  // in the relocation information.
-  void SetRecordedAstId(TypeFeedbackId ast_id) {
-    DCHECK(recorded_ast_id_.IsNone());
-    recorded_ast_id_ = ast_id;
-  }
-
-  TypeFeedbackId RecordedAstId() {
-    DCHECK(!recorded_ast_id_.IsNone());
-    return recorded_ast_id_;
-  }
-
-  void ClearRecordedAstId() { recorded_ast_id_ = TypeFeedbackId::None(); }
-
   // Record a comment relocation entry that can be used by a disassembler.
   // Use --code-comments to enable.
   void RecordComment(const char* msg);
@@ -1749,6 +1783,7 @@ class Assembler : public AssemblerBase {
 
   // Check if an instruction is a branch of some kind.
   static bool IsBranch(Instr instr);
+  static bool IsMsaBranch(Instr instr);
   static bool IsBc(Instr instr);
   static bool IsBzc(Instr instr);
   static bool IsBeq(Instr instr);
@@ -1840,11 +1875,6 @@ class Assembler : public AssemblerBase {
   int32_t LoadRegPlusUpperOffsetPartToAt(const MemOperand& src);
   int32_t LoadUpperOffsetForTwoMemoryAccesses(const MemOperand& src);
 
-  // Relocation for a type-recording IC has the AST id added to it.  This
-  // member variable is a way to pass the information from the call site to
-  // the relocation info.
-  TypeFeedbackId recorded_ast_id_;
-
   int32_t buffer_space() const { return reloc_info_writer.pos() - pc_; }
 
   // Decode branch instruction at pos and return branch target pos.
@@ -1913,6 +1943,9 @@ class Assembler : public AssemblerBase {
   inline void CheckBuffer();
 
  private:
+  // Avoid overflows for displacements etc.
+  static const int kMaximalBufferSize = 512 * MB;
+
   inline static void set_target_internal_reference_encoded_at(Address pc,
                                                               Address target);
 

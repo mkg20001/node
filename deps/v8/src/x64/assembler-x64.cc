@@ -309,11 +309,13 @@ Assembler::Assembler(IsolateData isolate_data, void* buffer, int buffer_size)
   reloc_info_writer.Reposition(buffer_ + buffer_size_, pc_);
 }
 
-
-void Assembler::GetCode(CodeDesc* desc) {
-  // Finalize code (at this point overflow() may be true, but the gap ensures
-  // that we are still not overlapping instructions and relocation info).
+void Assembler::GetCode(Isolate* isolate, CodeDesc* desc) {
+  // At this point overflow() may be true, but the gap ensures
+  // that we are still not overlapping instructions and relocation info.
   DCHECK(pc_ <= reloc_info_writer.pos());  // No overlap.
+
+  AllocateRequestedHeapNumbers(isolate);
+
   // Set up code descriptor.
   desc->buffer = buffer_;
   desc->buffer_size = buffer_size_;
@@ -880,14 +882,11 @@ void Assembler::call(Address entry, RelocInfo::Mode rmode) {
   emit_runtime_entry(entry, rmode);
 }
 
-
-void Assembler::call(Handle<Code> target,
-                     RelocInfo::Mode rmode,
-                     TypeFeedbackId ast_id) {
+void Assembler::call(Handle<Code> target, RelocInfo::Mode rmode) {
   EnsureSpace ensure_space(this);
   // 1110 1000 #32-bit disp.
   emit(0xE8);
-  emit_code_target(target, rmode, ast_id);
+  emit_code_target(target, rmode);
 }
 
 
@@ -934,7 +933,6 @@ void Assembler::cld() {
   EnsureSpace ensure_space(this);
   emit(0xFC);
 }
-
 
 void Assembler::cdq() {
   EnsureSpace ensure_space(this);
@@ -1537,6 +1535,14 @@ void Assembler::movp(Register dst, void* value, RelocInfo::Mode rmode) {
   emit_rex(dst, kPointerSize);
   emit(0xB8 | dst.low_bits());
   emitp(value, rmode);
+}
+
+void Assembler::movp_heap_number(Register dst, double value) {
+  EnsureSpace ensure_space(this);
+  emit_rex(dst, kPointerSize);
+  emit(0xB8 | dst.low_bits());
+  RequestHeapNumber(value);
+  emitp(nullptr, RelocInfo::EMBEDDED_OBJECT);
 }
 
 void Assembler::movq(Register dst, int64_t value, RelocInfo::Mode rmode) {
@@ -2892,11 +2898,11 @@ void Assembler::pextrw(Register dst, XMMRegister src, int8_t imm8) {
   DCHECK(is_uint8(imm8));
   EnsureSpace ensure_space(this);
   emit(0x66);
-  emit_optional_rex_32(dst, src);
+  emit_optional_rex_32(src, dst);
   emit(0x0F);
   emit(0x3A);
   emit(0x15);
-  emit_sse_operand(dst, src);
+  emit_sse_operand(src, dst);
   emit(imm8);
 }
 
@@ -4634,6 +4640,26 @@ void Assembler::psrldq(XMMRegister dst, uint8_t shift) {
   emit(0x73);
   emit_sse_operand(dst);
   emit(shift);
+}
+
+void Assembler::pshufhw(XMMRegister dst, XMMRegister src, uint8_t shuffle) {
+  EnsureSpace ensure_space(this);
+  emit(0xF3);
+  emit_optional_rex_32(dst, src);
+  emit(0x0F);
+  emit(0x70);
+  emit_sse_operand(dst, src);
+  emit(shuffle);
+}
+
+void Assembler::pshuflw(XMMRegister dst, XMMRegister src, uint8_t shuffle) {
+  EnsureSpace ensure_space(this);
+  emit(0xF2);
+  emit_optional_rex_32(dst, src);
+  emit(0x0F);
+  emit(0x70);
+  emit_sse_operand(dst, src);
+  emit(shuffle);
 }
 
 void Assembler::pshufd(XMMRegister dst, XMMRegister src, uint8_t shuffle) {

@@ -40,7 +40,6 @@ class PPCOperandConverter final : public InstructionOperandConverter {
         return LeaveRC;
     }
     UNREACHABLE();
-    return LeaveRC;
   }
 
   bool CompareLogical() const {
@@ -54,7 +53,6 @@ class PPCOperandConverter final : public InstructionOperandConverter {
         return false;
     }
     UNREACHABLE();
-    return false;
   }
 
   Operand InputImmediate(size_t index) {
@@ -78,7 +76,6 @@ class PPCOperandConverter final : public InstructionOperandConverter {
         break;
     }
     UNREACHABLE();
-    return Operand::Zero();
   }
 
   MemOperand MemoryOperand(AddressingMode* mode, size_t* first_index) {
@@ -95,7 +92,6 @@ class PPCOperandConverter final : public InstructionOperandConverter {
         return MemOperand(InputRegister(index + 0), InputRegister(index + 1));
     }
     UNREACHABLE();
-    return MemOperand(r0);
   }
 
   MemOperand MemoryOperand(AddressingMode* mode, size_t first_index = 0) {
@@ -293,7 +289,6 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
       break;
   }
   UNREACHABLE();
-  return kNoCondition;
 }
 
 }  // namespace
@@ -592,11 +587,12 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
     AddressingMode mode = kMode_None;                    \
     MemOperand operand = i.MemoryOperand(&mode, &index); \
     DoubleRegister value = i.InputDoubleRegister(index); \
-    __ frsp(kScratchDoubleReg, value);                   \
+    /* removed frsp as instruction-selector checked */   \
+    /* value to be kFloat32 */                           \
     if (mode == kMode_MRI) {                             \
-      __ stfs(kScratchDoubleReg, operand);               \
+      __ stfs(value, operand);                           \
     } else {                                             \
-      __ stfsx(kScratchDoubleReg, operand);              \
+      __ stfsx(value, operand);                          \
     }                                                    \
     DCHECK_EQ(LeaveRC, i.OutputRCBit());                 \
   } while (0)
@@ -704,11 +700,13 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
     __ bge(&done);                                      \
     DoubleRegister value = i.InputDoubleRegister(3);    \
     __ frsp(kScratchDoubleReg, value);                  \
+    /* removed frsp as instruction-selector checked */  \
+    /* value to be kFloat32 */                          \
     if (mode == kMode_MRI) {                            \
-      __ stfs(kScratchDoubleReg, operand);              \
+      __ stfs(value, operand);                          \
     } else {                                            \
       CleanUInt32(offset);                              \
-      __ stfsx(kScratchDoubleReg, operand);             \
+      __ stfsx(value, operand);                         \
     }                                                   \
     __ bind(&done);                                     \
     DCHECK_EQ(LeaveRC, i.OutputRCBit());                \
@@ -2083,7 +2081,7 @@ void CodeGenerator::AssembleArchTrap(Instruction* instr,
         __ Ret();
       } else {
         gen_->AssembleSourcePosition(instr_);
-        __ Call(handle(isolate()->builtins()->builtin(trap_id), isolate()),
+        __ Call(isolate()->builtins()->builtin_handle(trap_id),
                 RelocInfo::CODE_TARGET);
         ReferenceMap* reference_map =
             new (gen_->zone()) ReferenceMap(gen_->zone());
@@ -2221,7 +2219,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleDeoptimizerCall(
   // actual final call site and just bl'ing to it here, similar to what we do
   // in the lithium backend.
   if (deopt_entry == nullptr) return kTooManyDeoptimizationBailouts;
-  if (isolate()->NeedsSourcePositionsForProfiling()) {
+  if (info()->is_source_positions_enabled()) {
     __ RecordDeoptReason(deoptimization_reason, pos, deoptimization_id);
   }
   __ Call(deopt_entry, RelocInfo::RUNTIME_ENTRY);
@@ -2293,7 +2291,7 @@ void CodeGenerator::AssembleConstructFrame() {
     // remaining stack slots.
     if (FLAG_code_comments) __ RecordComment("-- OSR entrypoint --");
     osr_pc_offset_ = __ pc_offset();
-    shrink_slots -= OsrHelper(info()).UnoptimizedFrameSlots();
+    shrink_slots -= osr_helper()->UnoptimizedFrameSlots();
   }
 
   const RegList double_saves = descriptor->CalleeSavedFPRegisters();

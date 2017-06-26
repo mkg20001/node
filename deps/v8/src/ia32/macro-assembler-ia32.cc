@@ -420,7 +420,7 @@ void MacroAssembler::RecordWriteField(
   lea(dst, FieldOperand(object, offset));
   if (emit_debug_code()) {
     Label ok;
-    test_b(dst, Immediate((1 << kPointerSizeLog2) - 1));
+    test_b(dst, Immediate(kPointerSize - 1));
     j(zero, &ok, Label::kNear);
     int3();
     bind(&ok);
@@ -743,13 +743,13 @@ void MacroAssembler::SarPair_cl(Register high, Register low) {
 bool MacroAssembler::IsUnsafeImmediate(const Immediate& x) {
   static const int kMaxImmediateBits = 17;
   if (!RelocInfo::IsNone(x.rmode_)) return false;
-  return !is_intn(x.x_, kMaxImmediateBits);
+  return !is_intn(x.immediate(), kMaxImmediateBits);
 }
 
 
 void MacroAssembler::SafeMove(Register dst, const Immediate& x) {
   if (IsUnsafeImmediate(x) && jit_cookie() != 0) {
-    Move(dst, Immediate(x.x_ ^ jit_cookie()));
+    Move(dst, Immediate(x.immediate() ^ jit_cookie()));
     xor_(dst, jit_cookie());
   } else {
     Move(dst, x);
@@ -759,7 +759,7 @@ void MacroAssembler::SafeMove(Register dst, const Immediate& x) {
 
 void MacroAssembler::SafePush(const Immediate& x) {
   if (IsUnsafeImmediate(x) && jit_cookie() != 0) {
-    push(Immediate(x.x_ ^ jit_cookie()));
+    push(Immediate(x.immediate() ^ jit_cookie()));
     xor_(Operand(esp, 0), Immediate(jit_cookie()));
   } else {
     push(x);
@@ -821,6 +821,16 @@ void MacroAssembler::AssertSmi(Register object) {
   }
 }
 
+void MacroAssembler::AssertFixedArray(Register object) {
+  if (emit_debug_code()) {
+    test(object, Immediate(kSmiTagMask));
+    Check(not_equal, kOperandIsASmiAndNotAFixedArray);
+    Push(object);
+    CmpObjectType(object, FIXED_ARRAY_TYPE, object);
+    Pop(object);
+    Check(equal, kOperandIsNotAFixedArray);
+  }
+}
 
 void MacroAssembler::AssertFunction(Register object) {
   if (emit_debug_code()) {
@@ -995,9 +1005,12 @@ void MacroAssembler::EnterExitFramePrologue(StackFrame::Type frame_type) {
   push(Immediate(CodeObject()));  // Accessed from ExitFrame::code_slot.
 
   // Save the frame pointer and the context in top.
-  ExternalReference c_entry_fp_address(Isolate::kCEntryFPAddress, isolate());
-  ExternalReference context_address(Isolate::kContextAddress, isolate());
-  ExternalReference c_function_address(Isolate::kCFunctionAddress, isolate());
+  ExternalReference c_entry_fp_address(IsolateAddressId::kCEntryFPAddress,
+                                       isolate());
+  ExternalReference context_address(IsolateAddressId::kContextAddress,
+                                    isolate());
+  ExternalReference c_function_address(IsolateAddressId::kCFunctionAddress,
+                                       isolate());
   mov(Operand::StaticVariable(c_entry_fp_address), ebp);
   mov(Operand::StaticVariable(context_address), esi);
   mov(Operand::StaticVariable(c_function_address), ebx);
@@ -1081,7 +1094,8 @@ void MacroAssembler::LeaveExitFrame(bool save_doubles, bool pop_arguments) {
 
 void MacroAssembler::LeaveExitFrameEpilogue(bool restore_context) {
   // Restore current context from top and clear it in debug mode.
-  ExternalReference context_address(Isolate::kContextAddress, isolate());
+  ExternalReference context_address(IsolateAddressId::kContextAddress,
+                                    isolate());
   if (restore_context) {
     mov(esi, Operand::StaticVariable(context_address));
   }
@@ -1090,7 +1104,7 @@ void MacroAssembler::LeaveExitFrameEpilogue(bool restore_context) {
 #endif
 
   // Clear the top frame.
-  ExternalReference c_entry_fp_address(Isolate::kCEntryFPAddress,
+  ExternalReference c_entry_fp_address(IsolateAddressId::kCEntryFPAddress,
                                        isolate());
   mov(Operand::StaticVariable(c_entry_fp_address), Immediate(0));
 }
@@ -1110,7 +1124,8 @@ void MacroAssembler::PushStackHandler() {
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0);
 
   // Link the current handler as the next handler.
-  ExternalReference handler_address(Isolate::kHandlerAddress, isolate());
+  ExternalReference handler_address(IsolateAddressId::kHandlerAddress,
+                                    isolate());
   push(Operand::StaticVariable(handler_address));
 
   // Set this new handler as the current one.
@@ -1120,7 +1135,8 @@ void MacroAssembler::PushStackHandler() {
 
 void MacroAssembler::PopStackHandler() {
   STATIC_ASSERT(StackHandlerConstants::kNextOffset == 0);
-  ExternalReference handler_address(Isolate::kHandlerAddress, isolate());
+  ExternalReference handler_address(IsolateAddressId::kHandlerAddress,
+                                    isolate());
   pop(Operand::StaticVariable(handler_address));
   add(esp, Immediate(StackHandlerConstants::kSize - kPointerSize));
 }
@@ -1557,9 +1573,9 @@ void MacroAssembler::GetMapConstructor(Register result, Register map,
   bind(&done);
 }
 
-void MacroAssembler::CallStub(CodeStub* stub, TypeFeedbackId ast_id) {
+void MacroAssembler::CallStub(CodeStub* stub) {
   DCHECK(AllowThisStubCall(stub));  // Calls are not allowed in some stubs.
-  call(stub->GetCode(), RelocInfo::CODE_TARGET, ast_id);
+  call(stub->GetCode(), RelocInfo::CODE_TARGET);
 }
 
 
@@ -1878,7 +1894,6 @@ void MacroAssembler::InvokeFunction(Register fun,
   mov(ebx, FieldOperand(edi, JSFunction::kSharedFunctionInfoOffset));
   mov(esi, FieldOperand(edi, JSFunction::kContextOffset));
   mov(ebx, FieldOperand(ebx, SharedFunctionInfo::kFormalParameterCountOffset));
-  SmiUntag(ebx);
 
   ParameterCount expected(ebx);
   InvokeFunctionCode(edi, new_target, expected, actual, flag, call_wrapper);
@@ -2052,7 +2067,7 @@ void MacroAssembler::Move(Register dst, Register src) {
 
 
 void MacroAssembler::Move(Register dst, const Immediate& x) {
-  if (x.is_zero() && RelocInfo::IsNone(x.rmode_)) {
+  if (!x.is_heap_number() && x.is_zero() && RelocInfo::IsNone(x.rmode_)) {
     xor_(dst, dst);  // Shorter than mov of 32-bit immediate 0.
   } else {
     mov(dst, x);
@@ -2127,10 +2142,24 @@ void MacroAssembler::Move(XMMRegister dst, uint64_t src) {
   }
 }
 
+void MacroAssembler::Pshufd(XMMRegister dst, const Operand& src,
+                            uint8_t shuffle) {
+  if (CpuFeatures::IsSupported(AVX)) {
+    CpuFeatureScope scope(this, AVX);
+    vpshufd(dst, src, shuffle);
+  } else {
+    pshufd(dst, src, shuffle);
+  }
+}
 
 void MacroAssembler::Pextrd(Register dst, XMMRegister src, int8_t imm8) {
   if (imm8 == 0) {
-    movd(dst, src);
+    Movd(dst, src);
+    return;
+  }
+  if (CpuFeatures::IsSupported(AVX)) {
+    CpuFeatureScope scope(this, AVX);
+    vpextrd(dst, src, imm8);
     return;
   }
   if (CpuFeatures::IsSupported(SSE4_1)) {
@@ -2480,6 +2509,7 @@ void MacroAssembler::CallCFunction(ExternalReference function,
 
 void MacroAssembler::CallCFunction(Register function,
                                    int num_arguments) {
+  DCHECK_LE(num_arguments, kMaxCParameters);
   DCHECK(has_frame());
   // Check stack alignment.
   if (emit_debug_code()) {

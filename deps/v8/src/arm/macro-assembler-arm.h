@@ -41,7 +41,6 @@ inline MemOperand FieldMemOperand(Register object, int offset) {
 
 // Give alias names to registers
 const Register cp = {Register::kCode_r7};  // JavaScript context pointer.
-const Register pp = {Register::kCode_r8};  // Constant pool pointer.
 const Register kRootRegister = {Register::kCode_r10};  // Roots array pointer.
 
 // Flags used for AllocateHeapNumber
@@ -102,9 +101,7 @@ class MacroAssembler: public Assembler {
   // checking the call size and emitting the actual call.
   static int CallSize(Register target, Condition cond = al);
   int CallSize(Address target, RelocInfo::Mode rmode, Condition cond = al);
-  int CallStubSize(CodeStub* stub,
-                   TypeFeedbackId ast_id = TypeFeedbackId::None(),
-                   Condition cond = al);
+  int CallStubSize(CodeStub* stub, Condition cond = al);
 
   // Jump, Call, and Ret pseudo instructions implementing inter-working.
   void Jump(Register target, Condition cond = al);
@@ -115,12 +112,11 @@ class MacroAssembler: public Assembler {
             TargetAddressStorageMode mode = CAN_INLINE_TARGET_ADDRESS,
             bool check_constant_pool = true);
   void Call(Handle<Code> code, RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
-            TypeFeedbackId ast_id = TypeFeedbackId::None(), Condition cond = al,
+            Condition cond = al,
             TargetAddressStorageMode mode = CAN_INLINE_TARGET_ADDRESS,
             bool check_constant_pool = true);
   int CallSize(Handle<Code> code,
                RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
-               TypeFeedbackId ast_id = TypeFeedbackId::None(),
                Condition cond = al);
   void Ret(Condition cond = al);
 
@@ -183,7 +179,7 @@ class MacroAssembler: public Assembler {
   void Move(Register dst, Register src, Condition cond = al);
   void Move(Register dst, const Operand& src, SBit sbit = LeaveCC,
             Condition cond = al) {
-    if (!src.is_reg() || !src.rm().is(dst) || sbit != LeaveCC) {
+    if (!src.IsRegister() || !src.rm().is(dst) || sbit != LeaveCC) {
       mov(dst, src, sbit, cond);
     }
   }
@@ -474,12 +470,10 @@ class MacroAssembler: public Assembler {
     }
   }
 
-  // Push a fixed frame, consisting of lr, fp, constant pool (if
-  // FLAG_enable_embedded_constant_pool)
+  // Push a fixed frame, consisting of lr, fp
   void PushCommonFrame(Register marker_reg = no_reg);
 
-  // Push a standard frame, consisting of lr, fp, constant pool (if
-  // FLAG_enable_embedded_constant_pool), context and JS function
+  // Push a standard frame, consisting of lr, fp, context and JS function
   void PushStandardFrame(Register function_reg);
 
   void PopCommonFrame(Register marker_reg = no_reg);
@@ -562,20 +556,17 @@ class MacroAssembler: public Assembler {
   void VmovExtended(Register dst, int src_code);
   void VmovExtended(int dst_code, Register src);
   // Move between s-registers and imaginary s-registers.
-  void VmovExtended(int dst_code, int src_code, Register scratch);
-  void VmovExtended(int dst_code, const MemOperand& src, Register scratch);
-  void VmovExtended(const MemOperand& dst, int src_code, Register scratch);
+  void VmovExtended(int dst_code, int src_code);
+  void VmovExtended(int dst_code, const MemOperand& src);
+  void VmovExtended(const MemOperand& dst, int src_code);
 
   void ExtractLane(Register dst, QwNeonRegister src, NeonDataType dt, int lane);
   void ExtractLane(Register dst, DwVfpRegister src, NeonDataType dt, int lane);
-  void ExtractLane(SwVfpRegister dst, QwNeonRegister src, Register scratch,
-                   int lane);
+  void ExtractLane(SwVfpRegister dst, QwNeonRegister src, int lane);
   void ReplaceLane(QwNeonRegister dst, QwNeonRegister src, Register src_lane,
                    NeonDataType dt, int lane);
   void ReplaceLane(QwNeonRegister dst, QwNeonRegister src,
-                   SwVfpRegister src_lane, Register scratch, int lane);
-  void Swizzle(QwNeonRegister dst, QwNeonRegister src, Register scratch,
-               NeonSize size, uint32_t lanes);
+                   SwVfpRegister src_lane, int lane);
 
   void LslPair(Register dst_low, Register dst_high, Register src_low,
                Register src_high, Register scratch, Register shift);
@@ -1019,7 +1010,6 @@ class MacroAssembler: public Assembler {
 
   // Call a code stub.
   void CallStub(CodeStub* stub,
-                TypeFeedbackId ast_id = TypeFeedbackId::None(),
                 Condition cond = al);
 
   // Call a code stub.
@@ -1221,6 +1211,9 @@ class MacroAssembler: public Assembler {
   void AssertNotSmi(Register object);
   void AssertSmi(Register object);
 
+  // Abort execution if argument is not a FixedArray, enabled via --debug-code.
+  void AssertFixedArray(Register object);
+
   // Abort execution if argument is not a JSFunction, enabled via --debug-code.
   void AssertFunction(Register object);
 
@@ -1336,11 +1329,6 @@ class MacroAssembler: public Assembler {
   void TestJSArrayForAllocationMemento(Register receiver_reg,
                                        Register scratch_reg,
                                        Label* no_memento_found);
-
-  // Loads the constant pool pointer (pp) register.
-  void LoadConstantPoolPointerRegisterFromCodeTargetAddress(
-      Register code_target_address);
-  void LoadConstantPoolPointerRegister();
 
  private:
   void CallCFunctionHelper(Register function,

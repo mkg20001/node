@@ -461,8 +461,8 @@ class ArrayConcatVisitor {
     // The object holding this backing store has just been allocated, so
     // it cannot yet be used as a prototype.
     Handle<JSObject> not_a_prototype_holder;
-    Handle<SeededNumberDictionary> result = SeededNumberDictionary::AtNumberPut(
-        dict, index, elm, not_a_prototype_holder);
+    Handle<SeededNumberDictionary> result =
+        SeededNumberDictionary::Set(dict, index, elm, not_a_prototype_holder);
     if (!result.is_identical_to(dict)) {
       // Dictionary needed to grow.
       clear_storage();
@@ -498,9 +498,9 @@ class ArrayConcatVisitor {
         isolate_->factory()->NewNumber(static_cast<double>(index_offset_));
     Handle<Map> map = JSObject::GetElementsTransitionMap(
         array, fast_elements() ? FAST_HOLEY_ELEMENTS : DICTIONARY_ELEMENTS);
-    array->set_map(*map);
     array->set_length(*length);
     array->set_elements(*storage_fixed_array());
+    array->synchronized_set_map(*map);
     return array;
   }
 
@@ -535,8 +535,8 @@ class ArrayConcatVisitor {
             // it cannot yet be used as a prototype.
             Handle<JSObject> not_a_prototype_holder;
             Handle<SeededNumberDictionary> new_storage =
-                SeededNumberDictionary::AtNumberPut(slow_storage, i, element,
-                                                    not_a_prototype_holder);
+                SeededNumberDictionary::Set(slow_storage, i, element,
+                                            not_a_prototype_holder);
             if (!new_storage.is_identical_to(slow_storage)) {
               slow_storage = loop_scope.CloseAndEscape(new_storage);
             }
@@ -639,7 +639,6 @@ uint32_t EstimateElementCount(Handle<JSArray> array) {
     case FAST_STRING_WRAPPER_ELEMENTS:
     case SLOW_STRING_WRAPPER_ELEMENTS:
       UNREACHABLE();
-      return 0;
   }
   // As an estimate, we assume that the prototype doesn't contain any
   // inherited elements.
@@ -727,9 +726,12 @@ void CollectElementIndices(Handle<JSObject> object, uint32_t range,
       }
     case FAST_SLOPPY_ARGUMENTS_ELEMENTS:
     case SLOW_SLOPPY_ARGUMENTS_ELEMENTS: {
+      DisallowHeapAllocation no_gc;
+      FixedArrayBase* elements = object->elements();
+      JSObject* raw_object = *object;
       ElementsAccessor* accessor = object->GetElementsAccessor();
       for (uint32_t i = 0; i < range; i++) {
-        if (accessor->HasElement(object, i)) {
+        if (accessor->HasElement(raw_object, i, elements)) {
           indices->Add(i);
         }
       }
@@ -749,7 +751,7 @@ void CollectElementIndices(Handle<JSObject> object, uint32_t range,
       }
       ElementsAccessor* accessor = object->GetElementsAccessor();
       for (; i < range; i++) {
-        if (accessor->HasElement(object, i)) {
+        if (accessor->HasElement(*object, i)) {
           indices->Add(i);
         }
       }
@@ -964,7 +966,7 @@ Object* Slow_ArrayConcat(BuiltinArguments* args, Handle<Object> species,
   ElementsKind kind = FAST_SMI_ELEMENTS;
 
   uint32_t estimate_result_length = 0;
-  uint32_t estimate_nof_elements = 0;
+  uint32_t estimate_nof = 0;
   FOR_WITH_HANDLE_SCOPE(isolate, int, i = 0, i, i < argument_count, i++, {
     Handle<Object> obj((*args)[i], isolate);
     uint32_t length_estimate;
@@ -992,10 +994,10 @@ Object* Slow_ArrayConcat(BuiltinArguments* args, Handle<Object> species,
     } else {
       estimate_result_length += length_estimate;
     }
-    if (JSObject::kMaxElementCount - estimate_nof_elements < element_estimate) {
-      estimate_nof_elements = JSObject::kMaxElementCount;
+    if (JSObject::kMaxElementCount - estimate_nof < element_estimate) {
+      estimate_nof = JSObject::kMaxElementCount;
     } else {
-      estimate_nof_elements += element_estimate;
+      estimate_nof += element_estimate;
     }
   });
 
@@ -1003,7 +1005,7 @@ Object* Slow_ArrayConcat(BuiltinArguments* args, Handle<Object> species,
   // fixed array (fast case) is more time and space-efficient than a
   // dictionary.
   bool fast_case = is_array_species &&
-                   (estimate_nof_elements * 2) >= estimate_result_length &&
+                   (estimate_nof * 2) >= estimate_result_length &&
                    isolate->IsIsConcatSpreadableLookupChainIntact();
 
   if (fast_case && kind == FAST_DOUBLE_ELEMENTS) {
@@ -1091,10 +1093,7 @@ Object* Slow_ArrayConcat(BuiltinArguments* args, Handle<Object> species,
     storage =
         isolate->factory()->NewFixedArrayWithHoles(estimate_result_length);
   } else if (is_array_species) {
-    // TODO(126): move 25% pre-allocation logic into Dictionary::Allocate
-    uint32_t at_least_space_for =
-        estimate_nof_elements + (estimate_nof_elements >> 2);
-    storage = SeededNumberDictionary::New(isolate, at_least_space_for);
+    storage = SeededNumberDictionary::New(isolate, estimate_nof);
   } else {
     DCHECK(species->IsConstructor());
     Handle<Object> length(Smi::kZero, isolate);
@@ -1203,15 +1202,9 @@ BUILTIN(ArrayConcat) {
   HandleScope scope(isolate);
 
   Handle<Object> receiver = args.receiver();
-  // TODO(bmeurer): Do we really care about the exact exception message here?
-  if (receiver->IsNullOrUndefined(isolate)) {
-    THROW_NEW_ERROR_RETURN_FAILURE(
-        isolate, NewTypeError(MessageTemplate::kCalledOnNullOrUndefined,
-                              isolate->factory()->NewStringFromAsciiChecked(
-                                  "Array.prototype.concat")));
-  }
   ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
-      isolate, receiver, Object::ToObject(isolate, args.receiver()));
+      isolate, receiver,
+      Object::ToObject(isolate, args.receiver(), "Array.prototype.concat"));
   args[0] = *receiver;
 
   Handle<JSArray> result_array;

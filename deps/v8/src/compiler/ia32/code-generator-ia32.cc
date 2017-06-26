@@ -74,11 +74,9 @@ class IA32OperandConverter : public InstructionOperandConverter {
       case Constant::kInt32:
         return Immediate(constant.ToInt32());
       case Constant::kFloat32:
-        return Immediate(
-            isolate()->factory()->NewNumber(constant.ToFloat32(), TENURED));
+        return Immediate::EmbeddedNumber(constant.ToFloat32());
       case Constant::kFloat64:
-        return Immediate(
-            isolate()->factory()->NewNumber(constant.ToFloat64(), TENURED));
+        return Immediate::EmbeddedNumber(constant.ToFloat64());
       case Constant::kExternalReference:
         return Immediate(constant.ToExternalReference());
       case Constant::kHeapObject:
@@ -89,7 +87,6 @@ class IA32OperandConverter : public InstructionOperandConverter {
         return Immediate::CodeRelativeOffset(ToLabel(operand));
     }
     UNREACHABLE();
-    return Immediate(-1);
   }
 
   static size_t NextOffset(size_t* offset) {
@@ -165,10 +162,8 @@ class IA32OperandConverter : public InstructionOperandConverter {
       }
       case kMode_None:
         UNREACHABLE();
-        return Operand(no_reg, 0);
     }
     UNREACHABLE();
-    return Operand(no_reg, 0);
   }
 
   Operand MemoryOperand(size_t first_input = 0) {
@@ -780,7 +775,7 @@ class OutOfLineRecordWrite final : public OutOfLineCode {
     Label binop;                                                \
     __ bind(&binop);                                            \
     __ mov_inst(eax, i.MemoryOperand(1));                       \
-    __ mov_inst(i.TempRegister(0), Operand(eax));               \
+    __ Move(i.TempRegister(0), eax);                            \
     __ bin_inst(i.TempRegister(0), i.InputRegister(0));         \
     __ lock();                                                  \
     __ cmpxchg_inst(i.MemoryOperand(1), i.TempRegister(0));     \
@@ -1897,16 +1892,17 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kIA32I32x4Splat: {
       XMMRegister dst = i.OutputSimd128Register();
-      __ movd(dst, i.InputOperand(0));
-      __ pshufd(dst, dst, 0x0);
+      __ Movd(dst, i.InputOperand(0));
+      __ Pshufd(dst, dst, 0x0);
       break;
     }
     case kIA32I32x4ExtractLane: {
       __ Pextrd(i.OutputRegister(), i.InputSimd128Register(0), i.InputInt8(1));
       break;
     }
-    case kIA32I32x4ReplaceLane: {
-      __ Pinsrd(i.OutputSimd128Register(), i.InputOperand(2), i.InputInt8(1));
+    case kSSEI32x4ReplaceLane: {
+      CpuFeatureScope sse_scope(masm(), SSE4_1);
+      __ pinsrd(i.OutputSimd128Register(), i.InputOperand(2), i.InputInt8(1));
       break;
     }
     case kSSEI32x4Add: {
@@ -1915,6 +1911,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kSSEI32x4Sub: {
       __ psubd(i.OutputSimd128Register(), i.InputOperand(1));
+      break;
+    }
+    case kAVXI32x4ReplaceLane: {
+      CpuFeatureScope avx_scope(masm(), AVX);
+      __ vpinsrd(i.OutputSimd128Register(), i.InputSimd128Register(0),
+                 i.InputOperand(2), i.InputInt8(1));
       break;
     }
     case kAVXI32x4Add: {
@@ -2115,7 +2117,6 @@ static Condition FlagsConditionToCondition(FlagsCondition condition) {
       break;
     default:
       UNREACHABLE();
-      return no_condition;
       break;
   }
 }
@@ -2181,7 +2182,7 @@ void CodeGenerator::AssembleArchTrap(Instruction* instr,
         __ Ret();
       } else {
         gen_->AssembleSourcePosition(instr_);
-        __ Call(handle(isolate()->builtins()->builtin(trap_id), isolate()),
+        __ Call(isolate()->builtins()->builtin_handle(trap_id),
                 RelocInfo::CODE_TARGET);
         ReferenceMap* reference_map =
             new (gen_->zone()) ReferenceMap(gen_->zone());
@@ -2286,7 +2287,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleDeoptimizerCall(
   Address deopt_entry = Deoptimizer::GetDeoptimizationEntry(
       isolate(), deoptimization_id, bailout_type);
   if (deopt_entry == nullptr) return kTooManyDeoptimizationBailouts;
-  if (isolate()->NeedsSourcePositionsForProfiling()) {
+  if (info()->is_source_positions_enabled()) {
     __ RecordDeoptReason(deoptimization_reason, pos, deoptimization_id);
   }
   __ call(deopt_entry, RelocInfo::RUNTIME_ENTRY);
@@ -2464,7 +2465,7 @@ void CodeGenerator::AssembleConstructFrame() {
     // remaining stack slots.
     if (FLAG_code_comments) __ RecordComment("-- OSR entrypoint --");
     osr_pc_offset_ = __ pc_offset();
-    shrink_slots -= OsrHelper(info()).UnoptimizedFrameSlots();
+    shrink_slots -= osr_helper()->UnoptimizedFrameSlots();
   }
 
   const RegList saves = descriptor->CalleeSavedRegisters();
@@ -2565,13 +2566,7 @@ void CodeGenerator::AssembleMove(InstructionOperand* source,
       } else {
         DCHECK(destination->IsStackSlot());
         Operand dst = g.ToOperand(destination);
-        AllowDeferredHandleDereference embedding_raw_address;
-        if (isolate()->heap()->InNewSpace(*src)) {
-          __ PushHeapObject(src);
-          __ pop(dst);
-        } else {
-          __ mov(dst, src);
-        }
+        __ mov(dst, src);
       }
     } else if (destination->IsRegister()) {
       Register dst = g.ToRegister(destination);
